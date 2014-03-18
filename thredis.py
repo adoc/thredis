@@ -5,12 +5,14 @@ from __future__ import absolute_import
 import logging
 log = logging.getLogger(__name__)
 
-import thread
-import urlparse
+import threading
+import urllib.parse
 import redis
 
+from safedict import SafeDict
 
-class RedisPool(object):
+
+class RedisPool:
     """
     A Redis implementation that utilizes a process persistent
     ConnectionPool.
@@ -46,8 +48,8 @@ class RedisPool(object):
         Can accept a urlparse.ParseResult or a string.
 
         """ 
-        if not isinstance(url, urlparse.ParseResult):
-            url = urlparse.urlparse(url)
+        if not isinstance(url, urllib.parse.ParseResult):
+            url = urllib.parse.urlparse(url)
 
         assert url.scheme == 'redis' or not url.scheme
 
@@ -64,114 +66,151 @@ class RedisPool(object):
         return self.__client_cls(connection_pool=self.__pool)
 
 
-class ThreadLocalRedis(RedisPool):
+class ThreadLocalRedisPool(RedisPool):
     """
     A persistent Redis implementation that provides thread local
     clients and pipelines. A single instance of this class is meant to
     be shared to multiple threads.
 
     """
-    __clients = {}
-    __pipelines = {}
-
-    def __init__(self, thread_ident_func=thread.get_ident, **kwa):
-        """
-
-        """
-        RedisPool.__init__(self, **kwa)
-        self.__thread_ident_func = thread_ident_func
-        
-    @property
-    def _thread_id(self):
-        # Executes the thread id function and returns the result.
-        return self.__thread_ident_func()
+    __registry = SafeDict(threading.get_ident)
 
     @property
     def client(self):
         """Returns a thread local Redis Client."""
-        thread_id = self._thread_id
-        client = self.__clients[thread_id] = \
-            self.__clients.get(thread_id,
-                                self.get_client())
+        try:
+            client = self.__registry['client']
+        except KeyError:
+            client = self.__registry['client'] = self.get_client()
+
         return client
 
     @property
     def pipeline(self):
         """Returns a thread local Redis Pipeline."""
-        thread_id = self._thread_id
-        pipeline = self.__pipelines[thread_id] = \
-            self.__pipelines.get(thread_id,
-                                    self.client.pipeline())
+        try:
+            pipeline = self.__registry['pipeline']
+        except KeyError:
+            pipeline = self.__registry['pipeline'] = self.client.pipeline()
+
         return pipeline
 
-    def remove_pipeline(self, thread_id=None):
+    def remove_pipeline(self):
         """Remove the thread local Redis Pipeline."""
-        thread_id = thread_id or self._thread_id
-        if thread_id in self.__pipelines:
+
+        if 'pipeline' in self.__registry:
             log.debug("%s: Removing Redis Pipeline for thread: %s." %
-                        (self.__class__.__name__, thread_id))
-            del self.__pipelines[thread_id]        
+                        (self.__class__.__name__, self.__registry.thread_id))
+            del self.__registry['pipeline']
 
-    def remove_client(self, thread_id=None):
+    def remove_client(self):
         """Remove the thread local Redis Pipeline and Client."""
-        thread_id = thread_id or self._thread_id
-        self.remove_pipeline(thread_id=thread_id)
-        if thread_id in self.__clients:
+
+        if 'client' in self.__registry:
             log.debug("%s: Removing Redis Client for thread: %s." %
-                        (self.__class__.__name__, thread_id))
-            del self.__clients[thread_id]
+                        (self.__class__.__name__, self.__registry.thread_id))
+            self.remove_pipeline()
+            del self.__registry['client']
 
-    def remove(self):
-        """Alias to `remove_client`."""
-        self.remove_client(thread_id=self._thread_id)
+    remove = remove_client
 
 
-# Sample implementation.
-
-class NotificationsRedisCache(ThreadLocalRedis):
-    """API to Redis backend for the Notifications class. Implements Redis
-    Sorted Sets with the Unix Timestamp as the Score.
-
+class RedisCommandsMix(object):
     """
-    def add(self, key, score, data):
-        """Add Notification item to set using a Redis pipeline."""
+    This mixin unifies client and pipeline commands on a RedisPool
+    instance.
 
-        log.debug("%s: Adding member to Redis Sorted Set (%s, %s, %s)." %
-                    (self.__class__.__name__, key, score, data))
-        self.pipeline.zadd(key, score, data)
+    Some commands are pipelined and some are instant. We might want
+    this to put everything in to the pipeline, even gets.
+    """
+    @staticmethod
+    def zadd(*args, **kwa):
+        return lambda self: self.pipeline.zadd(*args, **kwa)
 
-    def count(self, key):
-        """ """
-        return self.client.zcard(key)
+    @staticmethod
+    def zrange(*args, **kwa):
+        return lambda self: self.client.zrange(*args, **kwa)
 
-    def get(self, key):
-        """Get all items in the sorted set."""
-        log.debug("%s: Retrieving Redis Sorted Sets for key (%s)." %
-                    (self.__class__.__name__, key))
-        return self.client.zrange(key, 0, -1, withscores=True)
+    @staticmethod
+    def zcard(*args, **kwa):
+        return lambda self: self.client.zcard(*args, **kwa)
 
-    def get_by_score(self, key, score):
-        """Get all items in the sorted set by `score`."""
-        log.debug("%s: Retrieving Redis Sorted Sets for key, score (%s, %s)." %
-                    (self.__class__.__name__, key, score))
-        return self.client.zrangebyscore(key, score, score, withscores=True)
+    @staticmethod
+    def zrangebyscore(*args, **kwa):
+        return lambda self: self.client.zrangebyscore(*args, **kwa)
 
-    def delete(self, key, *members, **kwa):
-        """Delete `members` from sorted set of `key`. Alternately if
-        `delete_key` is True then delete the entire key"""
-        if kwa.get('delete_key'):
-            log.debug("%s: Deleting Redis key (%s)." %
-                        (self.__class__.__name__, key))
-            self.pipeline.delete(key)
-        elif members:
-            log.debug("%s: Deleting member(s) of Redis Sorted Set (%s, %s)." %
-                        (self.__class__.__name__, key, members))
-            self.pipeline.zrem(key, *members)
-        else:
-            raise AttributeError("Nothing was done. No `members` specified and `delete_all` set to False.")
+    @staticmethod
+    def zrem(*args, **kwa):
+        return lambda self: self.pipeline.zrem(*args, **kwa)
 
-    def execute(self):
-        """Execute the thread local Redis pipeline"""
-        log.debug("%s: Executing Redis Pipeline (%s)." %
-                    (self.__class__.__name__, self._thread_id))
-        return self.pipeline.execute()
+    @staticmethod
+    def get(*args, **kwa):
+        return lambda self: self.client.get(*args, **kwa)
+
+    @staticmethod
+    def set(*args, **kwa):
+        return lambda self: self.pipeline.set(*args, **kwa)
+
+    @staticmethod
+    def delete(*args, **kwa):
+        return lambda self: self.pipeline.delete(*args, **kwa)
+
+
+class RedisSession:
+    """ """
+    __registry = SafeDict(threading.get_ident)
+
+    def __init__(self, pool, commandset=RedisCommandsMix):
+        self._pool = pool
+        self._commandset = RedisCommandsMix
+
+    @property
+    def queue(self):
+        try:
+            queue = self.__registry['queue']
+        except KeyError:
+            queue = self.__registry['queue'] = []
+        return queue
+
+    def remove_queue(self):
+        if 'queue' in self.__registry:
+            del self.__registry['queue']
+
+    def _transact(self, transaction):
+        return transaction(self._pool)
+
+    def set(self, *args, **kwa):
+        self.queue.append(self._commandset.set(*args, **kwa))
+
+    def get(self, *args, **kwa):
+        return self._transact(self._commandset.get(*args, **kwa))
+
+    def delete(self, *args, **kwa):
+        self.queue.append(self._commandset.delete(*args, **kwa))
+
+    def zadd(self, *args, **kwa):
+        self.queue.append(self._commandset.zadd(*args, **kwa))
+
+    def zrange(self, *args, **kwa):
+        return self._transact(self._commandset.zrange(*args, **kwa))
+
+    def zcard(self, *args, **kwa):
+        return self._transact(self._commandset.zcard(*args, **kwa))
+
+    def zrangebyscore(self, *args, **kwa):
+        return self._transact(self._commandset.zrangebyscore(*args, **kwa))
+
+    def zrem(self, *args, **kwa):
+        self.queue.append(self._commandset.zrem(*args, **kwa))
+
+    def flush(self):
+        results = [self._transact(transaction) for transaction in self.queue]
+        self.remove_queue()
+        return results
+
+    def commit(self):
+        self.flush()
+        try:
+            self._pool.pipeline.execute()
+        finally:
+            self._pool.remove_pipeline()
