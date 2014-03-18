@@ -1,7 +1,5 @@
 """Just some simple threaded redis pool classes."""
 
-from __future__ import absolute_import
-
 import logging
 log = logging.getLogger(__name__)
 
@@ -115,102 +113,22 @@ class ThreadLocalRedisPool(RedisPool):
     remove = remove_client
 
 
-class RedisCommandsMix(object):
-    """
-    This mixin unifies client and pipeline commands on a RedisPool
-    instance.
-
-    Some commands are pipelined and some are instant. We might want
-    this to put everything in to the pipeline, even gets.
-    """
-    @staticmethod
-    def zadd(*args, **kwa):
-        return lambda self: self.pipeline.zadd(*args, **kwa)
-
-    @staticmethod
-    def zrange(*args, **kwa):
-        return lambda self: self.client.zrange(*args, **kwa)
-
-    @staticmethod
-    def zcard(*args, **kwa):
-        return lambda self: self.client.zcard(*args, **kwa)
-
-    @staticmethod
-    def zrangebyscore(*args, **kwa):
-        return lambda self: self.client.zrangebyscore(*args, **kwa)
-
-    @staticmethod
-    def zrem(*args, **kwa):
-        return lambda self: self.pipeline.zrem(*args, **kwa)
-
-    @staticmethod
-    def get(*args, **kwa):
-        return lambda self: self.client.get(*args, **kwa)
-
-    @staticmethod
-    def set(*args, **kwa):
-        return lambda self: self.pipeline.set(*args, **kwa)
-
-    @staticmethod
-    def delete(*args, **kwa):
-        return lambda self: self.pipeline.delete(*args, **kwa)
-
-
-class RedisSession:
+class UnifiedSession(ThreadLocalRedisPool):
     """ """
-    __registry = SafeDict(threading.get_ident)
+    pipeline_commands = ('set', 'delete', 'zadd', 'zrem')
+    client_commands = ('info', 'flushall', 'get', 'zrange', 'zcard',
+                        'zrangebyscore')
 
-    def __init__(self, pool, commandset=RedisCommandsMix):
-        self._pool = pool
-        self._commandset = RedisCommandsMix
+    def __getattr__(self, attrname):
+        if attrname in self.pipeline_commands:
+            return getattr(self.pipeline, attrname)
+        elif attrname in self.client_commands:
+            return getattr(self.client, attrname)
+        else:
+            raise AttributeError("UnifiedSession has no attribute '%s'." % attrname)
 
-    @property
-    def queue(self):
+    def execute(self):
         try:
-            queue = self.__registry['queue']
-        except KeyError:
-            queue = self.__registry['queue'] = []
-        return queue
-
-    def remove_queue(self):
-        if 'queue' in self.__registry:
-            del self.__registry['queue']
-
-    def _transact(self, transaction):
-        return transaction(self._pool)
-
-    def set(self, *args, **kwa):
-        self.queue.append(self._commandset.set(*args, **kwa))
-
-    def get(self, *args, **kwa):
-        return self._transact(self._commandset.get(*args, **kwa))
-
-    def delete(self, *args, **kwa):
-        self.queue.append(self._commandset.delete(*args, **kwa))
-
-    def zadd(self, *args, **kwa):
-        self.queue.append(self._commandset.zadd(*args, **kwa))
-
-    def zrange(self, *args, **kwa):
-        return self._transact(self._commandset.zrange(*args, **kwa))
-
-    def zcard(self, *args, **kwa):
-        return self._transact(self._commandset.zcard(*args, **kwa))
-
-    def zrangebyscore(self, *args, **kwa):
-        return self._transact(self._commandset.zrangebyscore(*args, **kwa))
-
-    def zrem(self, *args, **kwa):
-        self.queue.append(self._commandset.zrem(*args, **kwa))
-
-    def flush(self):
-        results = [self._transact(transaction) for transaction in self.queue]
-        self.remove_queue()
-        return results
-
-    def commit(self):
-        self.flush()
-        try:
-            self._pool.pipeline.execute()
+            return self.pipeline.execute()
         finally:
-            self._pool.remove_pipeline()
+            self.remove_pipeline()
