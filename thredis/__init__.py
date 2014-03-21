@@ -228,14 +228,14 @@ class RedisObj:
     def __init__(self, *namespace, session=None):
         if isinstance(session, UnifiedSession):
             self.__session = session
-            self.__session.bind_exec_event(self._flushed)
+            self.__session.bind_exec_event(self._execute)
         elif session is None:
             self.__session = None
         else:
             raise ValueError("`RedisObj` session must be a `UnifiedSession`.")
         self.__namespace = namespace
 
-    def _flushed(self):
+    def _execute(self):
         """ """
         pass
 
@@ -247,7 +247,7 @@ class RedisObj:
             raise UnboundModelException("This model is not bound to any session.")
         else:
             return self.__session
-            self.__session.bind_exec_event(self._flushed)
+            self.__session.bind_exec_event(self._execute)
             
     @property
     def namespace(self):
@@ -342,6 +342,9 @@ class Hash(RedisObj):
         else:
             self.session.delete(Hash.gen_key(self, _id))
 
+    def flush(self, _id):
+        self.delete(_id, reference=False)
+
 
 class Set(RedisObj):
     """
@@ -373,7 +376,7 @@ class Set(RedisObj):
         RedisObj.__init__(self, *args, **kwa)
         self.__dirty_count = 0
 
-    def _flushed(self):
+    def _execute(self):
         """ """
         self.__dirty_count = 0
 
@@ -400,6 +403,14 @@ class Set(RedisObj):
     def delete(self, obj):
         self.session.zrem(self.gen_key(), obj)
         self.__dirty_count -= 1
+
+    def flush(self):
+        # TODO: Rename any other "flush" methods that aren't directly
+        #   related to removing keys or data.
+        """This will completely remove this sets namespace from Redis.
+
+        """
+        self.session.delete(self.gen_key())
 
     def insert(self, obj, at_idx):
         """Insert object `at_index`, reindexing all objects following."""
@@ -479,6 +490,13 @@ class Collection(RedisObj):
         _id = self.__hash.set(obj, **kwa)
         self.__index.insert(_id, kwa['idx'])
         return _id
+
+    def flush(self):
+        """Removes this entire collection from Redis."""
+        self.__active_index.flush()
+        for _id in self.__index:
+            self.__hash.flush(_id)
+        self.__index.flush()
 
     def delete(self):
         pass
