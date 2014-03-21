@@ -23,8 +23,9 @@ from safedict import SafeDict
 
 __all__ = ('JSONEncoder', 'JSONDecoder', 'json', 'dump_dict', 'load_dict', 'RedisPool',
             'ThreadLocalRedisPool', 'UnifiedSession', 'UnboundModelException', 'RedisObj',
-            'Hash', 'TestGeneralFunctions', 'TestRedisPoolClass', 'TestThreadLocalRedisPool',
-            'TestUnifiedSession', 'TestUnboundModelException', 'TestRedisObject')
+            'Hash', 'Set', 'Collection','TestGeneralFunctions', 'TestRedisPoolClass',
+            'TestThreadLocalRedisPool', 'TestUnifiedSession', 'TestUnboundModelException',
+            'TestRedisObject', 'TestHash', 'TestSet', 'TestCollection')
 
 
 # Let's monkeypatch json.dumps and json.loads to do what we want.
@@ -189,6 +190,10 @@ class UnifiedSession(ThreadLocalRedisPool):
     client_commands = ('info', 'flushall', 'get', 'hgetall', 'zrange', 'zcard',
                         'zrangebyscore')
 
+    def __init__(self, *args, **kwa):
+        ThreadLocalRedisPool.__init__(self, *args, **kwa)
+        self._exec_events = set()
+
     def __getattr__(self, attrname):
         if attrname in self.pipeline_commands:
             return getattr(self.pipeline, attrname)
@@ -197,10 +202,21 @@ class UnifiedSession(ThreadLocalRedisPool):
         else:
             raise AttributeError("UnifiedSession has no attribute '%s'." % attrname)
 
+    def bind_exec_event(self, callback):
+        self._exec_events.add(callback)
+
+    def unbind_exec_event(self, callback):
+        self._exec_events.discard(callback)
+
+    def trigger_exec_event(self):
+        for callback in self._exec_events:
+            callback()
+
     def execute(self):
         try:
             return self.pipeline.execute()
         finally:
+            self.trigger_exec_event()
             self.remove_pipeline()
 
 
@@ -214,11 +230,16 @@ class RedisObj:
     def __init__(self, *namespace, session=None):
         if isinstance(session, UnifiedSession):
             self.__session = session
+            self.__session.bind_exec_event(self._flushed)
         elif session is None:
             self.__session = None
         else:
             raise ValueError("`RedisObj` session must be a `UnifiedSession`.")
         self.__namespace = namespace
+
+    def _flushed(self):
+        """ """
+        pass
 
     @property
     def session(self):
@@ -228,6 +249,7 @@ class RedisObj:
             raise UnboundModelException("This model is not bound to any session.")
         else:
             return self.__session
+            self.__session.bind_exec_event(self._flushed)
             
     @property
     def namespace(self):
@@ -250,6 +272,19 @@ class RedisObj:
 
 class Hash(RedisObj):
     """
+
+
+    >>> import thredis
+    >>> 
+    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
+    >>> h = thredis.Hash('name', 'space', session=s)
+    >>> 
+    >>> id = h.set({'foo': True, 'bar': 'baz', 'boop': 123})
+    >>> h.session.execute();
+    [True]
+    >>> 
+    >>> h.get(id)
+    {'boop': 123, 'foo': True, 'bar': 'baz', '_id': UUID('d12a97cc-46f2-460b-96c8-02ff18f55c95')}
     """
     def __init__(self, *namespace, random_id_func=uuid.uuid4, **kwa):
         """
@@ -262,9 +297,11 @@ class Hash(RedisObj):
     def gen_key(self, _id):
         """
         """
+        if isinstance(_id, bytes):
+            _id = _id.decode()            
         return self.keyspace_separator.join([RedisObj.gen_key(self), str(_id)])
 
-    def redis_get(self, _id):
+    def _get(self, _id):
         """Do the actual get operation.
 
         """
@@ -273,9 +310,9 @@ class Hash(RedisObj):
     def get(self, _id):
         """
         """
-        return load_dict(Hash.redis_get(self, _id))
+        return load_dict(Hash._get(self, _id))
 
-    def redis_set(self, _id, obj):
+    def _set(self, _id, obj):
         """Do the actual set operation.
         """
         return self.session.hmset(Hash.gen_key(self, _id), obj)
@@ -285,12 +322,17 @@ class Hash(RedisObj):
         """
         if 'id' not in kwa and '_id' not in obj:
             kwa['id'] = self.__random_id_func()
-        elif '_id' in obj:
+        elif 'id' not in kwa and '_id' in obj:
             kwa['id'] = obj['_id']
+
+        if 'active' not in kwa and '_active' not in obj:
+            kwa['active'] = True
+        elif 'active' not in kwa and '_active' in obj:
+            kwa['active'] = obj['_active']
 
         # Append _ to any additional items and extend in to obj.
         obj.update({'_%s' % k: v for k, v in kwa.items()})
-        Hash.redis_set(self, obj['_id'], dump_dict(obj))
+        Hash._set(self, obj['_id'], dump_dict(obj))
         return obj['_id']
 
     def delete(self, _id, reference=True):
@@ -304,41 +346,100 @@ class Hash(RedisObj):
 
 
 class Set(RedisObj):
-    """ """
+    """
+
+    >>> import thredis
+    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
+    >>> se = thredis.Set('set', 'space', session=s)
+    >>> 
+    >>> se.add('set1')
+    >>> se.add('set2')
+    >>> se.add('set3')
+    >>> 
+    >>> se.session.execute()
+    [1, 1, 1]
+    >>> 
+    >>> se.all()
+    [b'set1', b'set2', b'set3']
+    >>> 
+    >>> se.insert('set1.5', 1)
+    >>> 
+    >>> se.session.execute()
+    [1, 0, 0]
+    >>> 
+    >>> se.all()
+    [b'set1', b'set1.5', b'set2', b'set3']
+    >>> 
+    """
+    def __init__(self, *args, **kwa):
+        RedisObj.__init__(self, *args, **kwa)
+        self.__dirty_count = 0
+
+    def _flushed(self):
+        """ """
+        self.__dirty_count = 0
+
     def count(self):
-        return self.session.zcard(self.gen_key())
+        return self.session.zcard(self.gen_key()) + self.__dirty_count
 
     def add(self, obj, score=None):
         if not isinstance(score, float):
-            idx = self.count()
-        self.session.zadd(self.gen_key(), idx, obj)
+            score = self.count()
+        self.session.zadd(self.gen_key(), score, obj)
+        self.__dirty_count += 1
 
     def range(self, from_idx, to_idx):
-        return self.session.zrange(self.gen_key(), from_idx, to_idx)
+        return self.session.zrange(self.gen_key(), int(from_idx), int(to_idx))
 
     def get(self, idx):
-        return self.range(idx, idx)
+        item = self.range(idx, idx)
+        if len(item) > 0:
+            return item[0]
 
     def all(self):
         return self.range(0, -1)
 
     def delete(self, obj):
         self.session.zrem(self.gen_key(), obj)
+        self.__dirty_count -= 1
 
     def insert(self, obj, at_idx):
         """Insert object `at_index`, reindexing all objects following."""
         idx = float(at_idx)
+        self.session.execute() # Unfortunate hack to keep the indexing correct.
         self.add(obj, score=idx)
         for item in self.range(idx, -1):
             idx += 1
             self.add(item, score=idx)
-            
-
-
-
+           
 
 class Collection(RedisObj):
     """Provides a hash and ordered set.
+
+    >>> import thredis
+    >>> 
+    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
+    >>> s.flushall()
+    True
+    >>> c = thredis.Collection('coll', 'space', session=s)
+    >>> 
+    >>> id = c.add({'foo': 'bars'})
+    >>> 
+    >>> c.session.execute()
+    [True, 1]
+    >>> 
+    >>> c.get(id)
+    {'foo': 'bars', '_idx': 0, '_id': UUID('3ff956ae-d36b-416b-8c83-9103a0ebc7ff')}
+    >>> 
+    >>> c.add({'foo': 'bars'})
+
+    >>> c.add({'foo': 'bars'})
+
+    >>> c.add({'foo': 'bars'})
+
+    >>> c.session.execute()
+    [True, 1, True, 1, True, 1]
+    >>> list(c.all(active_only=False))
 
     """
     def __init__(self, *namespace, **kwa):
@@ -354,13 +455,14 @@ class Collection(RedisObj):
             id_set = self.__active_index.all()
         else:
             id_set = self.__index.all()
-        return (Hash.get(_id) for _id in id_set)
+        print(id_set)
+        return (self.__hash.get(_id) for _id in id_set)
         
 
     def idx(self, _id, verify=True):
-        obj = Hash.get(self, _id)
+        obj = self.__hash.get(_id)
         
-        if not verify or Set.get(self, obj['_idx']) == obj['_id']:
+        if not verify or self.__index.get(obj['_idx']) == obj['_id']:
             return obj['_idx']
         else:
             # TODO: Custom exception for this. A bad one.
@@ -370,22 +472,21 @@ class Collection(RedisObj):
         pass
 
     def get(self, _id):
-        return Hash.get(self, _id)
+        return self.__hash.get(_id)
 
     def add(self, obj, **kwa):
-        if 'idx' in kwa:
-            # Do hash add and then put in to set before item at `idx`.
-            pass
-        else:
-            idx = Set.count(self)
-
-        _id = Hash.set(self, obj, idx=idx)
+        if 'idx' not in kwa:
+            kwa['idx'] = self.__index.count()
+        # Do hash add and then put in to set before item at `idx`.
+        _id = self.__hash.set(obj, **kwa)
+        self.__index.insert(_id, kwa['idx'])
+        return _id
 
     def delete(self):
         pass
 
 
-
+'''
 class Collection(Hash, Set):
     """Provides a hash and ordered set.
 
@@ -448,14 +549,16 @@ class Collection(Hash, Set):
         set_key = self.gen_set_key()
         self.session.zrem(set_key, id_)
         obj = self.get(id_)
-
-
+'''
 
 # TESTS
+import uuid
 import unittest
 import threading
 
+
 threadfunc = lambda func: threading.Thread(target=func)
+
 
 class RedisTestCase(unittest.TestCase):
     """Set up the redis connection information here. `url` is used in
@@ -474,6 +577,9 @@ class RedisTestCase(unittest.TestCase):
     url = "redis://127.0.0.1:6379/0"
 
     namespace = "test"
+
+    def _session(self):
+        return UnifiedSession.from_url(self.url)
 
 
 class TestGeneralFunctions(unittest.TestCase):
@@ -512,6 +618,18 @@ class TestGeneralFunctions(unittest.TestCase):
         l = {b'boo': b'true', b'baz': b'123.123', b'foo': b'"bar"', b'boop': b'false'}
         expect = {'foo': 'bar', 'boo': True, 'boop': False, 'baz': 123.123}
         self.assertEqual(load_dict(l), expect)
+
+
+class TestUnboundModelException(unittest.TestCase):
+    """Simply test that the exception is an exception. Once it logs or
+    does other things, we will add more tests.
+
+    """
+    def test_exception(self):
+        def do_raise():
+            raise UnboundModelException()
+        assert issubclass(UnboundModelException, Exception)
+        self.assertRaises(UnboundModelException, do_raise)
 
 
 class TestRedisPoolClass(RedisTestCase):
@@ -631,11 +749,8 @@ class TestThreadLocalRedisPool(RedisTestCase):
 
 class TestUnifiedSession(RedisTestCase):
     """ """
-    def _connect(self):
-        return UnifiedSession.from_url(self.url)
-
     def test_getattr(self, session=None):
-        session = session or self._connect()
+        session = session or self._session()
         for cmd in session.pipeline_commands:
             self.assertEqual(getattr(session.pipeline, cmd), getattr(session, cmd))
 
@@ -643,30 +758,15 @@ class TestUnifiedSession(RedisTestCase):
             self.assertEqual(getattr(session.client, cmd), getattr(session, cmd))
 
     def test_execute(self, session=None):
-        session = session or self._connect()
+        session = session or self._session()
 
         # No clue how to test the execute other than to use the
         #   commands on keys in the `test_namespace`
         self.assertTrue(False, 'No assertions for this test.')
 
 
-class TestUnboundModelException(unittest.TestCase):
-    """Simply test that the exception is an exception. Once it logs or
-    does other things, we will add more tests.
-
-    """
-    def test_exception(self):
-        def do_raise():
-            raise UnboundModelException()
-        assert issubclass(UnboundModelException, Exception)
-        self.assertRaises(UnboundModelException, do_raise)
-
-
 class TestRedisObject(RedisTestCase):
     """ """
-    def _connect(self):
-        return UnifiedSession.from_url(self.url)
-
     def _redisobj(self, session):
         return RedisObj(self.namespace, session=session)
 
@@ -676,7 +776,7 @@ class TestRedisObject(RedisTestCase):
         self.assertEqual(r._RedisObj__namespace, ('namespace1', 'namespace2'))
         self.assertIsNone(r._RedisObj__session)
 
-        s = self._connect()
+        s = self._session()
         r = RedisObj('namespace1', 'namespace2', session=s)
 
         self.assertEqual(r._RedisObj__namespace, ('namespace1', 'namespace2'))
@@ -687,7 +787,7 @@ class TestRedisObject(RedisTestCase):
 
         self.assertRaises(UnboundModelException, lambda: r.session)
 
-        s = self._connect()
+        s = self._session()
         r = self._redisobj(s)
 
         self.assertIs(r.session, s)
@@ -701,7 +801,7 @@ class TestRedisObject(RedisTestCase):
 
         self.assertRaises(ValueError, lambda: r.bind(None))
 
-        s = self._connect()
+        s = self._session()
         r.bind(s)
 
         self.assertIs(r.session, s)
@@ -712,4 +812,243 @@ class TestRedisObject(RedisTestCase):
 
 
 class TestHash(RedisTestCase):
-    pass
+    # TODO: Make sure to test both bytes and strings.
+    def _hash(self, session):
+        return Hash(self.namespace, 'hash', session=session)
+
+    def setUp(self):
+        session = self._session()
+        session.pipeline.hmset(self.namespace+':hash:1',
+                                {'_id': '1',
+                                    'foo': '"bartest!"'})
+        session.pipeline.hmset(self.namespace+':hash:2',
+                                {'_id': '2',
+                                    'foo': '"bartest!"',
+                                    'bar': 'true',
+                                    'baz': '123.123'})
+        session.pipeline.execute()
+
+    def test_init(self):
+        h = Hash('hash', 'space')
+        self.assertEqual(h.namespace, ('hash', 'space'))
+        self.assertIs(h._Hash__random_id_func, uuid.uuid4)
+
+    def test_gen_key(self):
+        h = Hash('hash', 'space')
+        self.assertEqual(h.gen_key('id123'), 'hash:space:id123')
+
+    def test__get(self):
+        h = self._hash(self._session())
+        self.assertEqual(h._get('1'), {b'_id': b'1',
+                                        b'foo': b'"bartest!"'})
+        self.assertEqual(h._get('2'), {b'_id': b'2',
+                                        b'foo': b'"bartest!"',
+                                        b'bar': b'true',
+                                        b'baz': b'123.123'})
+
+    def test_get(self):
+        h = self._hash(self._session())
+        self.assertEqual(h.get('1'), {'_id': 1,
+                                        'foo': 'bartest!'})
+        self.assertEqual(h.get('2'), {'_id': 2,
+                                        'foo': 'bartest!',
+                                        'bar': True,
+                                        'baz': 123.123})
+
+    def test__set(self):
+        s = self._session()
+        h = self._hash(s)
+        h._set('3', {'foo': '"bartest!"',
+                        'bar': 'true',
+                        'baz': '123.123'})
+        s.pipeline.execute()
+        self.assertEqual(s.client.hgetall(self.namespace+':hash:3'),
+                            {b'foo': b'"bartest!"',
+                                b'bar': b'true',
+                                b'baz': b'123.123'})
+
+    def test_set(self):
+        s = self._session()
+        h = self._hash(s)
+        _id = h.set({'foo': 'bartest!',
+                'bar': True,
+                'baz': 123.123})
+        s.pipeline.execute()
+        self.assertEqual(s.client.hgetall(self.namespace+':hash:'+str(_id)),
+                            {b'_id': b'"'+_id.urn.encode()+b'"',
+                                b'_active': b'true',
+                                b'foo': b'"bartest!"',
+                                b'bar': b'true',
+                                b'baz': b'123.123'})
+
+    def test_delete(self):
+        s = self._session()
+        h = self._hash(s)
+        s.pipeline.hmset(self.namespace+':hash:delete1',
+                                {'_id': '"delete1"',
+                                    '_active': 'true',
+                                    'foo': '"bartest!"'})
+        s.pipeline.hmset(self.namespace+':hash:delete2',
+                                {'_id': '"delete2"',
+                                    '_active': 'true',
+                                    'foo': '"bartest!"',
+                                    'bar': 'true',
+                                    'baz': '123.123'})
+
+        self.assertIsNotNone(s.client.hgetall(self.namespace+':hash:delete1'))
+        self.assertIsNotNone(s.client.hgetall(self.namespace+':hash:delete2'))        
+        h.delete('delete1')
+        h.delete('delete2', reference=False)
+        s.pipeline.execute()
+        self.assertEqual(s.client.hgetall(self.namespace+':hash:delete1')[b'_active'], b'false')
+        self.assertEqual(s.client.hgetall(self.namespace+':hash:delete2'), {})
+
+        
+class TestSet(RedisTestCase):
+    """"""
+    def _set(self, session, space='1'):
+        return Set(self.namespace, 'set', space, session=session)
+
+    def setUp(self):
+        session = self._session()
+        session.client.delete(self.namespace+':set:1')
+        session.client.delete(self.namespace+':set:2')
+        session.client.delete(self.namespace+':set:3')
+        session.client.delete(self.namespace+':set:4')
+        session.client.delete(self.namespace+':set:5')
+        session.client.delete(self.namespace+':set:6')
+        session.client.delete(self.namespace+':set:7')
+        session.pipeline.zadd(self.namespace+':set:1', 1.0, 'foobar')
+        session.pipeline.zadd(self.namespace+':set:1', 2.0, 'boobaz')
+        session.pipeline.zadd(self.namespace+':set:1', 3.0, 'booper')
+        session.pipeline.execute()
+
+    def test_count(self):
+        s = self._set(self._session())
+        self.assertIs(s.count(), 3)
+
+    def test_add(self):
+        session = self._session()
+        
+        s = self._set(session, space='2')
+        s.add('addtest1')
+        s.add('addtest2')
+        s.add('addtest1.5', score=0.5)
+        session.execute()
+        
+        self.assertEqual(
+            session.client.zrange(self.namespace+':set:2', 0, -1),
+                [b'addtest1', b'addtest1.5', b'addtest2'])
+
+    def test_range(self):
+        session = self._session()
+
+        session.pipeline.zadd(self.namespace+':set:3', 1.0, 'rangetest1')
+        session.pipeline.zadd(self.namespace+':set:3', 2.0, 'rangetest2')
+        session.pipeline.zadd(self.namespace+':set:3', 3.0, 'rangetest3')
+        session.pipeline.zadd(self.namespace+':set:3', 4.0, 'rangetest4')
+        session.pipeline.zadd(self.namespace+':set:3', 5.0, 'rangetest5')
+        session.pipeline.execute()
+
+        s = self._set(session, space='3')
+        self.assertEqual(s.range(0, -1), [b'rangetest1', b'rangetest2', b'rangetest3',
+                                            b'rangetest4', b'rangetest5'])
+        self.assertEqual(s.range(1,-2), [b'rangetest2', b'rangetest3',
+                                            b'rangetest4'])
+
+    def test_get(self):
+        session = self._session()
+
+        session.pipeline.zadd(self.namespace+':set:4', 1.0, 'gettest1')
+        session.pipeline.zadd(self.namespace+':set:4', 2.0, 'gettest2')
+        session.pipeline.zadd(self.namespace+':set:4', 3.0, 'gettest3')
+        session.pipeline.zadd(self.namespace+':set:4', 4.0, 'gettest4')
+        session.pipeline.zadd(self.namespace+':set:4', 5.0, 'gettest5')
+        session.pipeline.execute()
+
+        s = self._set(session, space='4')
+        self.assertEqual(s.get(0), b'gettest1')
+        self.assertEqual(s.get(2), b'gettest3')
+        self.assertEqual(s.get(-1), b'gettest5')
+
+
+    def test_all(self):
+        session = self._session()
+
+        session.pipeline.zadd(self.namespace+':set:5', 1.0, 'alltest1')
+        session.pipeline.zadd(self.namespace+':set:5', 2.0, 'alltest2')
+        session.pipeline.zadd(self.namespace+':set:5', 3.0, 'alltest3')
+        session.pipeline.zadd(self.namespace+':set:5', 4.0, 'alltest4')
+        session.pipeline.zadd(self.namespace+':set:5', 5.0, 'alltest5')
+        session.pipeline.execute()
+
+        s = self._set(session, space='5')
+
+        self.assertEqual(s.all(), [b'alltest1', b'alltest2', b'alltest3', b'alltest4', b'alltest5'])
+
+    def test_delete(self):
+        session = self._session()
+
+        session.pipeline.zadd(self.namespace+':set:6', 1.0, 'deletetest1')
+        session.pipeline.zadd(self.namespace+':set:6', 2.0, 'deletetest2')
+        session.pipeline.zadd(self.namespace+':set:6', 3.0, 'deletetest3')
+        session.pipeline.zadd(self.namespace+':set:6', 4.0, 'deletetest4')
+        session.pipeline.zadd(self.namespace+':set:6', 5.0, 'deletetest5')
+        session.pipeline.execute()
+
+        s = self._set(session, space='6')
+
+        s.delete('deletetest4')
+        s.delete('deletetest2')
+        s.session.execute()
+
+        self.assertEqual(session.zrange(self.namespace+':set:6', 0, -1),
+                [b'deletetest1', b'deletetest3', b'deletetest5'])
+
+    def test_insert(self):
+        session = self._session()
+
+        session.pipeline.zadd(self.namespace+':set:7', 1.0, 'deletetest1')
+        session.pipeline.zadd(self.namespace+':set:7', 3.0, 'deletetest3')
+        session.pipeline.zadd(self.namespace+':set:7', 5.0, 'deletetest5')
+        session.pipeline.execute()
+
+        s = self._set(session, space='7')
+
+        s.insert('deletetest2', 1)
+        s.insert('deletetest4', 3)
+
+        s.session.execute()
+
+        self.assertEqual(session.zrange(self.namespace+':set:7', 0, -1),
+                [b'deletetest1', b'deletetest2', b'deletetest3',  b'deletetest4', b'deletetest5'])
+
+
+class TestCollection(RedisTestCase):
+    def _collection(self, session):
+        return Collection(self.namespace, 'collection', session=session)
+
+    def test_init(self):
+        c = Collection('test', 'collection')
+
+        self.assertIsInstance(c._Collection__hash, Hash)
+        self.assertIsInstance(c._Collection__index, Set)
+        self.assertIsInstance(c._Collection__active_index, Set)
+
+    def test_all(self):
+        pass
+
+    def test_idx(self):
+        pass
+
+    def test_move(self):
+        pass
+
+    def test_get(self):
+        pass
+
+    def test_add(self):
+        pass
+
+    def test_delete(self):
+        pass
