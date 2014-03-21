@@ -23,9 +23,7 @@ from safedict import SafeDict
 
 __all__ = ('JSONEncoder', 'JSONDecoder', 'json', 'dump_dict', 'load_dict', 'RedisPool',
             'ThreadLocalRedisPool', 'UnifiedSession', 'UnboundModelException', 'RedisObj',
-            'Hash', 'Set', 'Collection','TestGeneralFunctions', 'TestRedisPoolClass',
-            'TestThreadLocalRedisPool', 'TestUnifiedSession', 'TestUnboundModelException',
-            'TestRedisObject', 'TestHash', 'TestSet', 'TestCollection')
+            'Hash', 'Set', 'Collection')
 
 
 # Let's monkeypatch json.dumps and json.loads to do what we want.

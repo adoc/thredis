@@ -3,7 +3,10 @@
 import uuid
 import unittest
 import threading
+import redis
+from safedict import SafeDict
 from thredis import *
+from thredis import Dummy
 
 threadfunc = lambda func: threading.Thread(target=func)
 
