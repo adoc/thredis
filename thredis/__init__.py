@@ -265,8 +265,7 @@ class RedisObj:
         return self.keyspace_separator.join(self.__namespace)
 
     def __del__(self):
-        print("RedisObj was deleted!!!!")
-
+        pass
 
 class Hash(RedisObj):
     """
