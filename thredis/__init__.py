@@ -464,9 +464,10 @@ class Collection(RedisObj):
             id_set = self.__active_index.all()
         else:
             id_set = self.__index.all()
-        print(id_set)
         return (self.__hash.get(_id) for _id in id_set)
-        
+
+    def all_list(self, **kwa):
+        return list(self.all(**kwa))
 
     def idx(self, _id, verify=True):
         obj = self.__hash.get(_id)
@@ -500,69 +501,3 @@ class Collection(RedisObj):
 
     def delete(self):
         pass
-
-
-'''
-class Collection(Hash, Set):
-    """Provides a hash and ordered set.
-
-    """
-    def __init__(self, *namespace, **kwa):
-        Hash.__init__(self, *namespace, **kwa)
-        Set.__init__(self, *namespace, **kwa)
-
-    @property
-    def keyspace(self):
-        return self._keyspace
-
-    def gen_hash_key(self, id_):
-        """Generate hash key."""
-        return self._hash_key_tmpl.format(keyspace=self.keyspace,
-                                            id=id_)
-
-    def gen_set_key(self):
-        """Generate set key."""
-        return self._set_key_tmpl.format(keyspace=self.keyspace)
-
-    def list(self, active_only=True):
-        """Ordered list of elements in the collection. This returns a generator."""
-        # This is a generator.
-        collection_ids = self.session.zrange(self.gen_set_key(), 0, -1)
-        return (self.session.hgetall(self.gen_hash_key(id_)) for id_ in collection_ids)
-
-    def idx(self, id, verify=True):
-        """Return the index position of the given id."""
-        obj = self.session.hmget(self.gen_hash_key(id_))
-        idx_ = obj['_idx']
-        if not verify or self.session.zrange(self.gen_set_key(), idx_, idx_) == obj['_id']:
-            return obj['_idx']
-        else:
-            raise Exception("Inconsitency in Redis. This is bad and should never happen.")
-
-    def move(self, id, to_idx):
-        pass
-
-    def get(self, id_):
-        """ """
-        return self._load_dict(self.session.hgetall(self.gen_hash_key(id_)))
-
-    def add(self, obj, active=True):
-        """Add object to the collection. Returns the id of the new object."""
-        set_key = self.gen_set_key()
-        idx_ = self.session.zcard(set_key) # Value of last index + 1
-        obj = isinstance(obj, dict) and obj or obj.__dict__
-        id_ = self._random_id_func()
-        obj['_active'] = active
-        obj['_id'] = id_
-        obj['_idx'] = idx_
-        # Set hash and record position in sorted set.
-        self.session.hmset(self.gen_hash_key(id_), self._dump_dict(obj))
-        self.session.zadd(set_key, idx_, id_)
-        return id_
-        
-    def delete(self, id_, reference=True):
-        """ """
-        set_key = self.gen_set_key()
-        self.session.zrem(set_key, id_)
-        obj = self.get(id_)
-'''
