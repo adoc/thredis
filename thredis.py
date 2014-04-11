@@ -24,7 +24,7 @@ from safedict import SafeDict
 
 __all__ = ('JSONEncoder', 'JSONDecoder', 'json', 'dump_dict', 'load_dict', 'RedisPool',
             'ThreadLocalRedisPool', 'UnifiedSession', 'UnboundModelException', 'RedisObj',
-            'String', 'List', 'Set')
+            'String', 'List', 'Set', 'ZSet', 'Hash')
 
 
 # Let's monkeypatch json.dumps and json.loads to do what we want.
@@ -364,6 +364,9 @@ class RedisObj:
         elif isinstance(val, set):
             return set([json.loads(v.decode()) for v in val])
 
+        elif isinstance(val, dict):
+            return load_dict(val)
+
         elif val:
             return json.loads(val)
 
@@ -371,92 +374,10 @@ class RedisObj:
     def egress(*args):
         return tuple([json.dumps(val) for val in args])
 
-    '''
-    # Decorators
+
     @staticmethod
-    @decorate
-    def provide_key(func):
-        def _provide_key(that, key, *args, **kwa):
-            return func(that, that.gen_key(key), *args, **kwa)
-        return _provide_key'''
-
-    '''
-    @staticmethod
-    @decorate
-    def ingress(func):
-        def _ingress(that, *args, **kwa):
-            val = func(that, *args, **kwa)
-
-            log.debug("""RedisObj.egress on `%s` with value "%s".""" %
-                                (func.__name__, val))
-
-            if isinstance(val, bytes):
-                return json.loads(val.decode())
-
-            elif isinstance(val, list):
-                return [json.loads(v.decode()) for v in val]
-
-            elif isinstance(val, set):
-                return set([json.loads(v.decode()) for v in val])
-
-            elif val:
-                return json.loads(val)
-
-        return _ingress'''
-
-    '''
-    @staticmethod
-    def egress(demarc):
-        def inner(decorated, demarc=demarc):
-            """Decorator for model actions that set data.
-            """
-
-            def decorator(func):
-                def _egress(that, *args, **kwa):
-                    key = args[0]
-                    log.debug("""RedisObj.egress on `%s` with key "%s".""" %
-                                (decorated.__name__, key))
-                    raw_vals = args[demarc:]
-                    args = args[1:demarc]
-                    vals = tuple([json.dumps(val) for val in raw_vals])
-
-                    return func(that, key, *args+vals, **kwa)
-                
-                return _egress
-
-            return decorate(decorator)(decorated)
-
-        if isinstance(demarc, int):
-            return inner
-        else:
-            return inner(demarc, 1)'''
-
-    '''
-    #@staticmethod
-    @decorate
-    @staticmethod
-    def ingress_hash(decorated):
-        """
-        """
-        def decorator(func):
-            def _ingress_hash(that, *args, **kwa):
-                return load_dict(func(that, *args, **kwa))
-            return _ingress_hash
-
-        return RedisObj.decorate(decorated, decorator)
-
-    #@staticmethod
-    @decorate
-    @staticmethod
-    def egress_hash(decorated):
-        """
-        """
-        def decorator(func):
-            def _prep_kwaset(that, key, *args, **kwa):
-                return func(that, key, *args, **dump_dict(kwa))
-            return _prep_kwaset
-
-        return RedisObj.decorate(decorated, decorator)'''
+    def egress_hash(**obj):
+        return dump_dict(obj)
 
 
 class String(RedisObj):
@@ -587,47 +508,39 @@ class Set(RedisObj):
     def delete(self, *objs):
         return self.r_delete(*self.egress(*objs))
 
-'''
-@RedisObj.provide_key
+
 class ZSet(RedisObj):
     """
     """
 
     reindex_threshold = 0.1
 
-    def r_reindex(self, key):
-        idx=0.0
-        for item in self.r_all(key):
-            self.session.zadd(key, idx, item)
-            idx += 1
-        return idx
-
-    def r_count(self, key):
-        return self.session.zcard(key)
-
-    @RedisObj.ingress
-    def r_range(self, key, from_idx, to_idx, reversed=False, withscores=False):
-        zrange = (reversed and self.session.zrevrange or
+    def r_range(self, from_idx, to_idx, reversed_=False, withscores=False):
+        key = self.gen_key()
+        zrange = (reversed_ and self.session.zrevrange or
                                 self.session.zrange)
         return zrange(key, int(from_idx), int(to_idx), withscores=withscores)
 
-    def r_all(self, key, reversed=False, withscores=False):
-        return self.r_range(key, 0, -1, reversed=reversed, withscores=withscores)
+    def r_all(self, reversed_=False, withscores=False):
+        key = self.gen_key()
+        return self.r_range(0, -1, reversed_, withscores)
 
-    def r_get(self, key, idx):
+    def r_get(self, idx):
+        key = self.gen_key()
         return self.r_range(key, idx, idx)
 
-    @RedisObj.egress
-    def r_add(self, key, obj):
-        last = self.session.zrange(key, -1, -1, withscores=True)
+    def r_add(self, obj):
+        score = 0.0
+        key = self.gen_key()
+        
+        last = self.session.zrange(key, -1, -1, withscores=True) # :(
+
         if last:
             score = last[0][1] + 1.0
-        else:
-            score = 0
         return self.session.zadd(key, score, obj)
 
-    @RedisObj.egress(3)
-    def r_between(self, key, low_idx, high_idx, obj):
+    def r_between(self, low_idx, high_idx, obj):
+        key = self.gen_key()
         left_score = 0.0
         right_score = 0.0
 
@@ -640,37 +553,85 @@ class ZSet(RedisObj):
         if rbound:
             right_score = rbound[0][1]
 
+        print(left_score, right_score)
+
         target_score = (left_score + right_score) / 2
-        variance = left_score - target_score
+        variance = right_score - target_score
 
         if variance < self.reindex_threshold:
             ret = self.session.client.zadd(key, target_score, obj)
             logging.info("Redis ZSet '%s' is reindexing. Variance (%s) fell "
                 "below threshold of (%s)." % (key, variance,
                                                 self.reindex_threshold))
-            self.r_reindex(key)
+            self.reindex()
             return ret
         else:
             return self.session.zadd(key, target_score, obj)
 
-    #@RedisObj.egress(2)
-    def r_insert(self, key, idx, obj):
-        return self.r_between(key, idx, idx-1, obj)
-
-    @RedisObj.egress
-    def r_delete(self, key, obj):
+    def r_delete(self, obj):
+        key = self.gen_key()
         return self.session.zrem(key, obj)
 
 
+    # Api functions
+    def reindex(self):
+        idx = 0.0
+        key = self.gen_key()
 
-@RedisObj.provide_key
+        for item in self.r_all():
+            self.session.zadd(key, idx, item)
+            idx += 1.0
+        return idx
+
+    def count(self):
+        key = self.gen_key()
+        return self.session.zcard(key)
+
+    def range(self, from_idx, to_idx, reversed=False):
+        return self.ingress(self.r_range(from_idx, to_idx, reversed))
+
+    def all(self, reversed=False):
+        return self.ingress(self.r_range(0,-1, reversed))
+
+    def get(self, idx):
+        return self.ingress(self.r_get(idx))
+
+    def add(self, obj):
+        return self.r_add(*self.egress(obj))
+
+    def between(self, low_idx, high_idx, obj):
+        return self.r_between(low_idx, high_idx, *self.egress(obj))
+
+    def insert(self, idx, obj):
+        return self.r_between(idx, idx-1, *self.egress(obj))
+
+    def delete(self, obj):
+        return self.r_delete(*self.egress(obj))
+
+
 class Hash(RedisObj):
     """
     """
-    pass
+    
+    # Low functions
+    def r_get(self, key):
+        key = self.gen_key(key)
+        return self.session.hgetall(key)
 
+    def r_set(self, key, obj):
+        key = self.gen_key(key)
+        return self.session.hmset(key, obj)
 
-'''
+    # API functions
+    def get(self, key):
+        return self.ingress(self.r_get(key))
+
+    def set(self, key, obj):
+        return self.r_set(key, self.egress_hash(**obj))
+
+    def delete(self, key):
+        key = self.gen_key(key)
+        return self.session.delete(key)
 
 
 
