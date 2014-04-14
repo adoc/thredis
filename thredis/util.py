@@ -12,8 +12,14 @@ import logging
 log = logging.getLogger(__name__)
 
 import collections
+import datetime
 import uuid
 import json as _json
+
+try:
+    import pytz
+except ImportError:
+    pytz = None
 
 
 __all__ = ('HashableOrderedDict', 'JsonEncoder', 'JsonDecoder', 'json')
@@ -48,6 +54,9 @@ class HashableOrderedDict(collections.OrderedDict):
     def __hash__(self):
         return hash(frozenset(self))
 
+# Roughly based on ISO8601
+isoformat = "urn:timestamp:%Y-%m-%dT%H:%M:%S"
+
 
 class JsonEncoder(_json.JSONEncoder):
     """Simple encoder to handle UUID types. Converts to URN (Universal
@@ -55,6 +64,12 @@ class JsonEncoder(_json.JSONEncoder):
     
     """
     def default(self, obj):
+        if (isinstance(obj, datetime.date) or
+            isinstance(obj, datetime.datetime)):
+            zone = ''
+            if obj.tzinfo:
+                zone = 'PYTZ:'+obj.tzinfo.zone
+            return obj.strftime(isoformat)+zone
         if isinstance(obj, uuid.UUID):
             return obj.urn
         if isinstance(obj, bytes):
@@ -72,6 +87,14 @@ class JsonDecoder(_json.JSONDecoder):
         # Handle potential UUID.
         if isinstance(obj, str) and obj.startswith('urn:uuid'):
             return uuid.UUID(obj)
+        if isinstance(obj, str) and obj.startswith('urn:timestamp'):
+            ts, *zone = obj.split('PYTZ:')
+            ts = datetime.datetime.strptime(ts, isoformat)
+            if zone:
+                if pytz is None:
+                    raise Exception("pytz module required to parse this timestamp: %s" % obj)
+                ts = pytz.timezone(*zone).localize(ts)
+            return ts
         else:
             return obj
 
@@ -93,6 +116,7 @@ class json:
     @staticmethod
     def dumps(*args, **kwa):
         kwa['separators'] = kwa.get('separators', (',', ':'))
+        kwa['sort_keys'] = True
         kwa['cls'] = kwa.get('cls', JsonEncoder)
         return _json.dumps(*args, **kwa)
 

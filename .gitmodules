@@ -1,0 +1,3 @@
+[submodule "safedict"]
+	path = safedict
+	url = https://gist.github.com/9588060.git
