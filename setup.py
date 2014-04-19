@@ -25,6 +25,6 @@ setup(name='thredis',
       include_package_data=True,
       zip_safe=False,
       install_requires=requires,
-      tests_require=requires,
-      test_suite="tests",
+      tests_require=requires+['nose',],
+      test_suite="thredis.tests",
       )

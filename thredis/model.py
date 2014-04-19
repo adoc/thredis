@@ -23,17 +23,15 @@ class RedisObj:
     keyspace_separator = ':'
 
     def __init__(self, *namespace, session=None):
-        if isinstance(session, UnifiedSession):
-            self.__session = session
-            self.__session.bind_exec_event(self._execute)
-        elif session is None:
-            self.__session = None
-        else:
-            raise ValueError("`RedisObj` session must be a `UnifiedSession`.")
+        self.__session = None
+        if session:
+            self.bind(session)
         if not len(namespace) > 0:
-            raise ValueError('`RedisObj` requires at least one namespace argument.')
+            raise ValueError('`RedisObj` requires at least one namespace '
+                             'argument.')
         self.__namespace = namespace
-        log.debug("RedisObj instantiated. namespace: %s" % (':'.join(self.__namespace)))
+        log.debug("RedisObj instantiated. namespace: %s" %
+                                                (':'.join(self.__namespace)))
 
     def _execute(self):
         """ """
@@ -56,6 +54,7 @@ class RedisObj:
     def bind(self, session):
         if isinstance(session, UnifiedSession):
             self.__session = session
+            self.__session.bind_exec_event(self._execute)
         else:
             raise ValueError("`bind` requires a UnifiedSession object.")
 
@@ -79,7 +78,9 @@ class RedisObj:
         pass
 
     # General model actions
-    def flush(self, *keyspace):
+    def delete(self, *keyspace):
+        if len(keyspace) < 1:
+            raise ValueError("Requires at least one positional argument for keyspace.")
         key = self.gen_key(*keyspace)
         return self.session.delete(key)
 
@@ -87,7 +88,6 @@ class RedisObj:
     @staticmethod
     def _ingress(val):
         """Ingress data."""
-        logging.debug(val)
         if isinstance(val, bytes):
             return json.loads(val.decode())
 
@@ -105,6 +105,8 @@ class RedisObj:
 
     @staticmethod
     def _egress(*args):
+        # This should be more opposite of what _ingress is, but lets
+        #   check implementation again.
         return tuple([json.dumps(val) for val in args])
 
 
@@ -127,7 +129,7 @@ class String(RedisObj):
         return self._ingress(self.r_get())
 
     def set(self, val):
-        return self.r_set(*self._egress(val))
+        return self.r_set(self._egress(val))
 
     def delete(self):
         key = self.gen_key()
@@ -162,7 +164,6 @@ class List(RedisObj):
     def r_rpop(self):
         key = self.gen_key()
         return self.session.rpop(key)
-
 
     # API functions
     def all(self):
@@ -632,7 +633,7 @@ class Hash(RedisObj):
         else:
             self.session.delete(Hash.gen_key(self, _id))
 
-    def flush(self, _id):
+    def delete(self, _id):
         self.delete(_id, reference=False)
 
 
@@ -698,8 +699,8 @@ class ZSet(RedisObj):
         self.session.zrem(self.gen_key(), obj)
         self.__dirty_count -= 1
 
-    def flush(self):
-        # TODO: Rename any other "flush" methods that aren't directly
+    def delete(self):
+        # TODO: Rename any other "delete" methods that aren't directly
         #   related to removing keys or data.
         """This will completely remove this sets namespace from Redis.
 
@@ -797,12 +798,12 @@ class Collection(RedisObj):
 
         return {'_id': obj['_id']}
 
-    def flush(self):
+    def delete(self):
         """Removes this entire collection from Redis."""
-        self.__active_index.flush()
+        self.__active_index.delete()
         for _id in self.__index:
-            self.__hash.flush(_id)
-        self.__index.flush()
+            self.__hash.delete(_id)
+        self.__index.delete()
 
     def delete(self, _id, **kwa):
         print('model delete.')

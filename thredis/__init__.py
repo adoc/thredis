@@ -207,6 +207,8 @@ class UnifiedSession(ThreadLocalRedisPool):
         if kwa.get('debug') is not True:
             self.debug_commands = ()
 
+        self.__do_pipeline = kwa.get('pipeline', True)
+
         ThreadLocalRedisPool.__init__(self, *args, **kwa)
         self._exec_events = set()
 

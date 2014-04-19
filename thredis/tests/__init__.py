@@ -1,15 +1,18 @@
 """ """
-
+print("GOT TESTS INIT")
 import uuid
 import unittest
 import threading
 import redis
 from safedict import SafeDict
 from thredis import *
-from thredis import Dummy
+
 
 threadfunc = lambda func: threading.Thread(target=func)
 
+
+class Dummy:
+    pass
 
 class RedisTestCase(unittest.TestCase):
     """Set up the redis connection information here. `url` is used in
