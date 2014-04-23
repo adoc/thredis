@@ -165,6 +165,11 @@ class List(RedisObj):
         key = self.gen_key()
         return self.session.rpop(key)
 
+    def r_linsert(self, pivot, value, before=None, after=None):
+        key = self.gen_key()
+        return self.session.linsert(key, pivot, value, before=before, after=after)
+
+
     # API functions
     def all(self):
         """Get all in list."""
@@ -199,6 +204,16 @@ class List(RedisObj):
         """Get last list item and remove it."""
         return self._ingress(self.r_rpop())
 
+    def before(self, pivot, value):
+        """ """
+        return self.r_linsert(self._egress(pivot),
+                              self._egress(value), before=True)
+
+    def after(self, pivot, value):
+        """ """
+        return self.r_linsert(self._egress(pivot),
+                              self._egress(value), after=True)
+
 
 class Set(RedisObj):
     """
@@ -220,7 +235,7 @@ class Set(RedisObj):
         key = self.gen_key()
         return self.session.srem(key, *objs)
 
-
+    #Api functions.
     def count(self):
         key = self.gen_key()
         return self.session.scard(key)
@@ -238,6 +253,41 @@ class Set(RedisObj):
         return self.r_delete(*self._egress(*objs))
 
 
+class Hash(RedisObj):
+    """
+    """
+
+    @staticmethod
+    def _egress(obj):
+        return json.dumpd(obj)
+
+    # Low functions
+    def r_get(self, key):
+        key = self.gen_key(key)
+        return self.session.hgetall(key)
+
+    def r_set(self, key, obj):
+        key = self.gen_key(key)
+        return self.session.hmset(key, obj)
+
+    # API functions
+    def get(self, key):
+        return self._ingress(self.r_get(key))
+
+    def set(self, key, obj):
+        return self.r_set(key, self._egress(obj))
+
+    def delete(self, key):
+        key = self.gen_key(key)
+        return self.session.delete(key)
+
+
+
+
+
+
+
+# Borked. Don't use
 class ZSet(RedisObj):
     """
     """
@@ -337,7 +387,7 @@ class ZSet(RedisObj):
     def delete(self, obj):
         return self.r_delete(*self._egress(obj))
 
-
+'''
 class Hash(RedisObj):
     """
     """
@@ -366,7 +416,7 @@ class Hash(RedisObj):
         key = self.gen_key(key)
         return self.session.delete(key)
 
-
+'''
 
 
 ## Extended Models
