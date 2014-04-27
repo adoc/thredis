@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 import functools
 import inspect
+import pprint
 import collections
 import time
 import threading
@@ -156,7 +157,7 @@ class UnifiedSession(ThreadLocalRedisPool):
       Lists:
         lrem, lindex, llen, lrange, lpop, rpop
       Hashes:
-        hgetall
+        hgetall, hmget
       Sets
         smembers, scard, sismember
       Sorted Sets
@@ -174,7 +175,7 @@ class UnifiedSession(ThreadLocalRedisPool):
                             # All keys
                             'delete',
                             # String
-                            'set',
+                            'set'
                             # Lists
                             'lset', 'linsert', 'lpush',
                             'rpush',
@@ -186,6 +187,7 @@ class UnifiedSession(ThreadLocalRedisPool):
                             'zadd', 'zrem')
 
     client_commands = (
+                        'keys',
                         # Strings
                         'get',
                         # Lists
@@ -193,13 +195,13 @@ class UnifiedSession(ThreadLocalRedisPool):
                         'lpop',
                         'rpop',
                         # Hashes
-                        'hgetall',
+                        'hgetall', 'hmget',
                         # Sets
                         'smembers', 'scard', 'sismember',
                         # Sorted Sets
                         'zrange', 'zrevrange', 'zcard', 'zrangebyscore')
 
-    debug_commands = ('flushall', 'info')
+    debug_commands = ('flushdb', 'info')
 
     def __init__(self, *args, **kwa):
         # Remove debug commands if not expressly in debug mode.
@@ -220,6 +222,19 @@ class UnifiedSession(ThreadLocalRedisPool):
         else:
             raise AttributeError("UnifiedSession has no attribute '%s'." %
                                     attrname)
+
+    def delete_wild(self, wildkey):
+        """ A quick shortcut to be able to delete wildcard namespaces.
+        Use responsibly!"""
+        keys = self.keys(wildkey)
+        self.delete(*keys)
+
+    def pp_keys(self, *args, sort=True):
+        """Pretty print the keys."""
+        keys = self.keys(*args)
+        if sort is True:
+            keys.sort()
+        pprint.pprint(keys)
 
     def bind_exec_event(self, callback):
         self._exec_events.add(callback)
