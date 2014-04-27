@@ -2,23 +2,20 @@
 import logging
 log = logging.getLogger(__name__)
 
-import os
-import base64
+
 import threading
+import base64
 import time
 import uuid
 from thredis import UnifiedSession
-from thredis.util import json
+from thredis.util import json, nonce512
 
 from safedict import SafeDict
 
-__all__ = ('UnboundModelException', 'ConstraintFailed', 'UniqueFailed',
+__all__ = ('nonce256', 'UnboundModelException', 'ConstraintFailed', 'UniqueFailed',
             'RedisObj',
             'String', 'List', 'Set', 'ZSet', 'Hash',
-            'ModelObject', 'Record')
-
-
-nonce = lambda: base64.b64encode(os.urandom(96))
+            'ModelObject', 'Record', 'Nonces')
 
 
 class UnboundModelException(Exception):
@@ -166,6 +163,12 @@ class String(RedisObj):
 class Lock(RedisObj):
     """Simple Lock Primitive based on http://redis.io/commands/set"""
 
+    lua_get_nonce = """
+        return redis.call("lpop", KEYS[1])
+    """
+
+
+
     lua = """
         if redis.call("get", KEYS[1]) == ARGV[1]
         then
@@ -197,6 +200,10 @@ class List(RedisObj):
     """
 
     # Low functions
+    def _count(self):
+        key = self.gen_key()
+        return key, self.session.llen(key)
+
     def _range(self, from_idx, to_idx):
         key = self.gen_key()
         return key, self.session.lrange(key, from_idx, to_idx)
@@ -216,6 +223,10 @@ class List(RedisObj):
     def _lpop(self):
         key = self.gen_key()
         return key, self.session.lpop(key)
+
+    def _blpop(self):
+        key = self.gen_key()
+        return key, self.session.blpop(key)
 
     def _rpop(self):
         key = self.gen_key()
@@ -237,10 +248,9 @@ class List(RedisObj):
 
     def count(self):
         """Return list count/length."""
-        key = self.gen_key()
-        # return self.session.llen(key)
+        key, raw = self._count()
         return {'key': key,
-                'raw': self.session.llen(key)}
+                'raw': raw}
 
     def lpush(self, *objs):
         """Insert obj(s) at start of list."""
@@ -777,7 +787,19 @@ class Record(ModelObject):
 
 
 
+class Nonces(List):
 
+    def gen(self, n):
+        for _ in range(n):
+            self._rpush(base64.b64encode(nonce512()).decode())
+
+    def count(self):
+        key, val = self._count()
+        return val
+
+    def get(self):
+        key, val = self._blpop()
+        return val
 
 
 
