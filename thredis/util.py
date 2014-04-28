@@ -11,6 +11,10 @@
 import logging
 log = logging.getLogger(__name__)
 
+import os
+import time
+import threading
+import hashlib
 import collections
 import datetime
 import uuid
@@ -19,10 +23,20 @@ import json as _json
 try:
     import pytz
 except ImportError:
+    log.warn("Pytz not installed. Some functionality in will be affected.")
     pytz = None
 
 
-__all__ = ('HashableOrderedDict', 'JsonEncoder', 'JsonDecoder', 'json')
+__all__ = ('nonce', 'nonce_n', 'nonce_h', 'nonce_nh', 'HashableOrderedDict',
+            'JsonEncoder', 'JsonDecoder', 'json', 'ModelLoopThread')
+
+
+NONCE_ATOM = 16 
+
+nonce = lambda: open('/dev/random', 'rb').read(NONCE_ATOM)
+nonce_n = lambda n: open('/dev/random', 'rb').read(NONCE_ATOM * n)
+nonce_h = lambda: hashlib.sha256(os.urandom(NONCE_ATOM ** 2)).digest()
+nonce_nh = lambda n: hashlib.sha256(os.urandom(NONCE_ATOM ** n)).digest()
 
 
 # Unused but saved for reference.
@@ -145,3 +159,30 @@ class json:
             k, v = qbytes(k, v)
             obj[k] = json.loads(v)
         return obj
+
+
+class ModelLoopThread(threading.Thread):
+    """Thread that loops indefinitely calling `callback` ever `throttle_ms`
+    milliseconds. Also provides a redis `model` to the callback function.
+    """
+    _throttle = None
+    def __init__(self, model=None, session=None, throttle_ms=100.0):
+        threading.Thread.__init__(self)
+        self.model = model
+        self.session = session
+        self._throttle = self._throttle or float(throttle_ms/1000.0)
+
+    def _callback(self):
+        raise NotImplementedError("Subclass ModelLoop to implement!")
+
+    def _nini(self):
+        time.sleep(self._throttle)
+
+    def run(self):
+        while True:
+            self._nini()
+            self._callback()
+            if self.session:
+                self.session.execute()
+            elif self.model:
+                self.model.session.execute()

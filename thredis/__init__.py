@@ -192,7 +192,7 @@ class UnifiedSession(ThreadLocalRedisPool):
                         'get',
                         # Lists
                         'lrem', 'lindex', 'llen', 'lrange',
-                        'lpop',
+                        'lpop', 'blpop',
                         'rpop',
                         # Hashes
                         'hgetall', 'hmget',

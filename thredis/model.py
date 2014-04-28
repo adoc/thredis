@@ -8,11 +8,11 @@ import base64
 import time
 import uuid
 from thredis import UnifiedSession
-from thredis.util import json, nonce512
+from thredis.util import json, nonce_nh
 
 from safedict import SafeDict
 
-__all__ = ('nonce256', 'UnboundModelException', 'ConstraintFailed', 'UniqueFailed',
+__all__ = ('UnboundModelException', 'ConstraintFailed', 'UniqueFailed',
             'RedisObj',
             'String', 'List', 'Set', 'ZSet', 'Hash',
             'ModelObject', 'Record', 'Nonces')
@@ -44,9 +44,9 @@ class RedisObj:
         if not len(namespace) > 0:
             raise ValueError('`RedisObj` requires at least one namespace '
                              'argument.')
-        self.__namespace = namespace
+        self._namespace = namespace
         log.debug("RedisObj instantiated. namespace: %s" %
-                                                (':'.join(self.__namespace)))
+                                                (':'.join(self._namespace)))
 
     def _execute(self):
         """ """
@@ -65,9 +65,9 @@ class RedisObj:
     def namespace(self):
         """ """
         if self.__type_in_namespace is True:
-            return self.__namespace + (self.__class__.__name__.lower(), )
+            return self._namespace + (self.__class__.__name__.lower(), )
         else:
-            return self.__namespace
+            return self._namespace
 
     def bind(self, session):
         if isinstance(session, UnifiedSession):
@@ -101,6 +101,10 @@ class RedisObj:
             raise ValueError("Requires at least one positional argument for keyspace.")
         key = self.gen_key(*keyspace)
         return self.session.delete(key)
+
+    def keys(self, *keyspace):
+        key = self.gen_key(*keyspace)
+        return self.session.keys(key)
 
     # Utilities
     @staticmethod
@@ -161,38 +165,98 @@ class String(RedisObj):
 
 
 class Lock(RedisObj):
-    """Simple Lock Primitive based on http://redis.io/commands/set"""
+    """Simple Lock Primitive based on http://redis.io/commands/set. We also
+    use LUA for speed here in dealing with the nonces. Nonces are usually added by a daemon to the
+    `nonces_key`."""
 
-    lua_get_nonce = """
-        return redis.call("lpop", KEYS[1])
+    l_acquire_lock = """
+        -- Attempt to acquire a lock on resource_key
+        local resource_key = KEYS[1]
+        local nonces_key = KEYS[2]
+        local nonce = redis.call("LPOP", nonces_key)
+        local timeout_ms = tostring(ARGV[1])
+        local timestamp = tostring(ARGV[2])
+        local lock_key = "lock:" .. resource_key
+        local lock_key_ts = "lock_ts:" .. resource_key
+        -- Set lock to nonce(id) with deadlock timeout_ms.
+        if nonce then
+            if redis.call("SET", lock_key, nonce, "NX", "PX", timeout_ms) then
+                -- We got the lock, set the timestamp and return the NONCE.
+                redis.call("SET", lock_key_ts, timestamp, "PX", timeout_ms)
+                return nonce
+            else
+                -- We got a nonce, but could not get the lock, return FALSE.
+                return false
+            end
+        else
+            -- No nonce available, return NIL.
+            return nil
+        end
     """
 
+    # Not sure I need this.
+    l_check_lock = """
+        -- Verify this nonce has the lock. This should help with deadlock
+        --   expiring locks but process still thinks it has the lock?
+    """
 
-
-    lua = """
-        if redis.call("get", KEYS[1]) == ARGV[1]
-        then
-            return redis.call("del", KEYS[1])
+    l_release_lock = """
+        -- Attempt to release the lock.
+        local resource_key = KEYS[1]
+        local key = "lock:" .. resource_key
+        local token = ARGV[1]
+        if redis.call("GET", key) == token then
+            return redis.call("DEL", key)
         else
-            return 0
-        end"""
+            return nil
+        end
+    """
     
     # Set lock
     # SET resource-name anystring NX EX max-lock-time
     # Unset Lock (Called by whom?)
     # EVAL ...script... 1 resource-name token-value
 
-    def __init__(self, *namespace, session=None, type_in_namespace=True,
-                 timeout=10000): 
-        self._timeout = timeout # deadlock timeout (10 sec might be way too high)
-        self._unlock_lua = self.client.register_script(self.lua)
+    nonces_key = 'nonces'
+
+    #race condition exists where the process takes longer than the deadlock
+    #   timeout. This must NEVER happen.
+
+    def __init__(self, *namespace, session=None, type_in_namespace=False,
+                 timeout_ms=5000, gen_id=False, id=None): 
+        RedisObj.__init__(self, *namespace, session=session,
+                          type_in_namespace=type_in_namespace)
+        self._timeout = timeout_ms # deadlock timeout
+        self._lua_acquire = self.session.client.register_script(self.l_acquire_lock)
+        self._lua_release = self.session.client.register_script(self.l_release_lock)
+        self._gen_id = gen_id
+        self._id = id
+
+    @property
+    def ts(self):
+        model = String('lock_ts', *self._namespace, session=self.session,
+                        type_in_namespace=False)
+        key, val = model._get()
+        return float(val)
 
     def acquire(self):
-        key = self.gen_key()
-        return self.client.set(key, nonce(), nx=True, px=self._timeout)
+        if self._gen_id is True:
+            # Testing only. Use Nonce generator and gen_id=False.
+            nonce = nonce512()
+            if self.session.client.set('lock:'+self.gen_key(), nonce, nx=True,
+                        px=self._timeout):
+                return self._id
+        else:
+            # The id of this lock is assigned by redis via the `nonces_key`
+            nonce = self._id = self._lua_acquire(keys=[self.gen_key(), self.nonces_key],
+                                 args=[self._timeout, time.time()])
+            return nonce
 
-    def release(self, nonce):
-        self._unlock_lua(keys=[self.gen_key()], args=[nonce])
+        # Did not acquire the lock
+        return False
+
+    def release(self):
+        return self._lua_release(keys=[self.gen_key()], args=[self._id])
 
 
 class List(RedisObj):
@@ -394,251 +458,58 @@ class Hash(RedisObj):
         return self.session.delete(key)
 
 
-
-
-# Borked. Don't use
 class ZSet(RedisObj):
     """
     """
+    def __init__(self, *namespace, session=None, type_in_namespace=True,
+                    asc=False):
+        RedisObj.__init__(self, *namespace, session=session,
+                            type_in_namespace=type_in_namespace)
+        self._asc=asc
 
-    reindex_threshold = 0.1
-
-    def r_range(self, from_idx, to_idx, reversed_=False, withscores=False):
+    def _range(self, from_idx, to_idx, withscores=False):
         key = self.gen_key()
-        zrange = (reversed_ and self.session.zrevrange or
-                                self.session.zrange)
-        return zrange(key, int(from_idx), int(to_idx), withscores=withscores)
+        zrange = (self._asc and self.session.zrange or self.session.zrevrange)
+        return key, zrange(key, int(from_idx), int(to_idx),
+                            withscores=withscores)
 
-    def r_all(self, reversed_=False, withscores=False):
+    def _all(self, withscores=False):
+        return self._range(0, -1, withscores=withscores)
+
+    def _get(self, idx, withscores=False):
+        return self._range(idx, idx, withscores=withscores)
+
+    def _add(self, obj, score):
         key = self.gen_key()
-        return self.r_range(0, -1, reversed_, withscores)
+        return key, self.session.zadd(key, score, obj)
 
-    def r_get(self, idx):
+    def _delete(self, obj):
         key = self.gen_key()
-        return self.r_range(key, idx, idx)
+        return key, self.session.zrem(key, obj)
 
-    def r_add(self, obj):
-        score = 0.0
+    def _count(self):
         key = self.gen_key()
-        
-        last = self.session.zrange(key, -1, -1, withscores=True) # :(
+        return key, self.session.zcard(key)
 
-        if last:
-            score = last[0][1] + 1.0
-        return self.session.zadd(key, score, obj)
-
-    def r_between(self, low_idx, high_idx, obj):
-        key = self.gen_key()
-        left_score = 0.0
-        right_score = 0.0
-
-        lbound = self.session.zrange(key, low_idx, low_idx, withscores=True)
-        rbound = self.session.zrange(key, high_idx, high_idx, withscores=True)
-
-        if lbound:
-            left_score = lbound[0][1]
-
-        if rbound:
-            right_score = rbound[0][1]
-
-        print(left_score, right_score)
-
-        target_score = (left_score + right_score) / 2
-        variance = right_score - target_score
-
-        if variance < self.reindex_threshold:
-            ret = self.session.client.zadd(key, target_score, obj)
-            logging.info("Redis ZSet '%s' is reindexing. Variance (%s) fell "
-                "below threshold of (%s)." % (key, variance,
-                                                self.reindex_threshold))
-            self.reindex()
-            return ret
-        else:
-            return self.session.zadd(key, target_score, obj)
-
-    def r_delete(self, obj):
-        key = self.gen_key()
-        return self.session.zrem(key, obj)
-
-
-    # Api functions
-    def reindex(self):
-        idx = 0.0
-        key = self.gen_key()
-
-        for item in self.r_all():
-            self.session.zadd(key, idx, item)
-            idx += 1.0
-        return idx
 
     def count(self):
-        key = self.gen_key()
-        return self.session.zcard(key)
+        return self._count()
 
-    def range(self, from_idx, to_idx, reversed=False):
-        return self._ingress(self.r_range(from_idx, to_idx, reversed))
+    def range(self, from_idx, to_idx):
+        return self._ingress(self._range(from_idx, to_idx,
+                                            withscores=True))
 
-    def all(self, reversed=False):
-        return self._ingress(self.r_range(0,-1, reversed))
+    def all(self, withscores=False):
+        return self._ingress(self._range(0, -1, withscores=withscores))
 
-    def get(self, idx):
-        return self._ingress(self.r_get(idx))
+    def get(self, idx, withscores=False):
+        return self._ingress(self._get(idx, withscores=withscores))
 
-    def add(self, obj):
-        return self.r_add(*self._egress(obj))
-
-    def between(self, low_idx, high_idx, obj):
-        return self.r_between(low_idx, high_idx, *self._egress(obj))
-
-    def insert(self, idx, obj):
-        return self.r_between(idx, idx-1, *self._egress(obj))
+    def add(self, obj, score):
+        return self._add(*self._egress(obj), score)
 
     def delete(self, obj):
-        return self.r_delete(*self._egress(obj))
-
-'''
-class Hash(RedisObj):
-    """
-    """
-
-    @staticmethod
-    def _egress(**obj):
-        return json.dumpd(obj)
-
-    # Low functions
-    def r_get(self, key):
-        key = self.gen_key(key)
-        return self.session.hgetall(key)
-
-    def r_set(self, key, obj):
-        key = self.gen_key(key)
-        return self.session.hmset(key, obj)
-
-    # API functions
-    def get(self, key):
-        return self._ingress(self.r_get(key))
-
-    def set(self, key, obj):
-        return self.r_set(key, self._egress(**obj))
-
-    def delete(self, key):
-        key = self.gen_key(key)
-        return self.session.delete(key)
-
-'''
-
-
-## Extended Models
-# This is where the concept of internal fields comes in to play.
-
-
-'''
-class Record(Hash):
-    """
-    """
-    ingressed_demarc = '_'
-    egressed_demarc = '__'
-    internal_keys = {'id', 'active', 'created', 'updated'}
-    internal_defaults = {'id': lambda rec: rec._key_func(),
-                         'active': True,
-                         'created': lambda rec: rec._time_func(),
-                         'updated': lambda rec: rec._time_func()}
-
-    def __init__(self, *namespace, key_func=uuid.uuid4, time_func=time.time,
-                    **kwa):
-        Hash.__init__(self, *namespace, **kwa)
-        self._key_func = key_func
-        self._time_func = time_func
-
-    @property
-    def egressed_internal_keys(self, *args):
-        # Return a set of internal keys as egressed (persisted)
-        return {self.egressed_demarc+key for key in self.internal_keys |
-                    set(args)}
-
-    @property
-    def ingressed_internal_keys(self, *args):
-        # Return a set of internal keys as ingressed (loaded)
-        return {self.ingressed_demarc+key for key in self.internal_keys |
-                    set(args)}
-
-
-    def _ingress_keys(self, *keys):
-        # From egressed to ingressed.
-
-        egressed_keys = set(keys) & self.egressed_internal_keys
-
-        return set(egressed.replace(self.egressed_demarc,
-                                    self.ingressed_demarc)
-                    for egressed in egressed_keys)
-
-
-    def _egress_keys(self, *keys):
-        # From ingressed to egressed.
-
-        ingressed_keys = set(keys) & self.ingressed_internal_keys
-
-        return set(ingressed.replace(self.ingressed_demarc,
-                                     self.egressed_demarc)
-                    for ingressed in ingressed_keys)
-
-
-
-    def _ingress(self, obj):
-        """Standard object ingress as well as some internal_key handling."""
-        obj = RedisObj._ingress(obj)
-
-        obj_key_names = set(obj.keys())
-
-        pulled_keys = self.internal_keys & obj_key_names
-
-        for pulled in pulled_keys:
-            obj[self.internal_key_demarc+pulled] = obj[pulled]
-            del obj[pulled]
-
-        return obj
-
-    def _egress(self, obj):
-        # Expects internals to be prepended with '_'
-        obj_key_names = set(obj.keys())
-        pushed_key_names = set(self.internal_key_demarc+key for
-                                    key in self.internal_keys)
-
-        for key in obj_key_names & pushed_key_names:
-            obj[key.lstrip('_')] = obj[key]
-            del obj[key]
-
-        return Hash._egress(**obj)
-
-    def create(self, obj):
-        obj_key_names = set(obj.keys())
-        pushed_key_names = set(self.internal_key_demarc+key for
-                                    key in self.internal_keys)
-
-        # Set defaults if do not exist.
-        # TODO: check out defaultdict for this.
-        missing_keys = pushed_key_names - obj_key_names
-        for missing in missing_keys:
-            default = self.internal_defaults.get(missing.lstrip('_'))
-            if callable(default):
-                obj[missing] = default(self)
-            else:
-                obj[missing] = default
-
-    def get(self, id_):
-        obj = Hash.get(self, id_)
-
-    def set(self, obj, **opts):
-        key = self.gen_key(*keyspace)
-
-    def delete(self, id_, reference=True):
-        """
-        """
-        if reference is True:
-            pass
-        else:
-            Hash.delete(self, id_)'''
-################################################################################
+        return self._delete(*self._egress(obj))
 
 
 # Start actual models.
@@ -783,15 +654,17 @@ class Record(ModelObject):
         self.update(**obj)
 
 
-
-
-
-
 class Nonces(List):
+    def __init__(self, *namespace, session=None, type_in_namespace=False):
+        List.__init__(self, *namespace, session=session,
+            type_in_namespace=type_in_namespace)
 
     def gen(self, n):
         for _ in range(n):
-            self._rpush(base64.b64encode(nonce512()).decode())
+            #rnd = base64.b64encode(nonce(self.size)).decode()
+            #rnd = rnd[:self._size]
+            #assert len(rnd) == self._size
+            self._rpush(nonce_nh(3))
 
     def count(self):
         key, val = self._count()
@@ -800,351 +673,3 @@ class Nonces(List):
     def get(self):
         key, val = self._blpop()
         return val
-
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-
-
-class Set(RedisObj):
-    def __init__(self, *args, **kwa):
-        RedisObj.__init__(self, *args, **kwa)
-
-    def count(self):
-        return self.session.scard(self.gen_key())
-
-    def add(self, *obj):
-        self.session.sadd(self.gen_key(), *obj)
-
-    def ismember(self, obj):
-        return self.session.sismember(self.gen_key(), obj)
-
-    def all(self):
-        return self.session.smembers(self.gen_key())
-
-    def delete(self, *obj):
-        self.session.srem(self.gen_key(), *obj)
-
-
-
-
-
-
-# Kind of an extended "Hash" object.
-class Hash(RedisObj):
-    """
-
-    >>> import thredis
-    >>> 
-    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
-    >>> h = thredis.Hash('name', 'space', session=s)
-    >>> 
-    >>> id = h.set({'foo': True, 'bar': 'baz', 'boop': 123})
-    >>> h.session.execute();
-    [True]
-    >>> 
-    >>> h.get(id)
-    {'boop': 123, 'foo': True, 'bar': 'baz', '_id': UUID('d12a97cc-46f2-460b-96c8-02ff18f55c95')}
-    """
-    id_attr = 'id'
-    internal_keys = {'active', 'idx'}
-    internal_defaults = {'active': True}
-
-    def __init__(self, *namespace, random_id_func=uuid.uuid4, **kwa):
-        """
-        """
-        RedisObj.__init__(self, *namespace, **kwa)
-        self.__random_id_func = random_id_func
-
-    @property
-    def _all_internal_keys(self):
-        return self.internal_keys | {self.id_attr}
-
-    def _get(self, _id):
-        """Do the actual get operation.
-
-        """
-        return self.session.hgetall(Hash.gen_key(self, _id))
-
-    def _set(self, _id, obj):
-        """Do the actual set operation.
-        """
-        return self.session.hmset(Hash.gen_key(self, _id), obj)
-
-    def gen_key(self, _id):
-        """Handles generating a key for a given hash `id`.
-        """
-        # TODO: Let's verify this is a clean solution.
-        if isinstance(_id, bytes):
-            _id = _id.decode()
-        return self.keyspace_separator.join([RedisObj.gen_key(self), str(_id)])
-
-    def get(self, _id, with_internal=True):
-        """
-        """
-        obj = load_dict(Hash._get(self, _id))
-
-        # prepend any "internal" keyspaces with '_'
-        for key in list(self._all_internal_keys):
-            if key in obj:
-                if with_internal is True:
-                    obj['_'+key] = obj[key]
-                del obj[key]
-        return obj
-
-        # obj['id'] = str(obj['_id'])
-        # del obj['_id']
-        # del obj['_idx']
-        # return obj
-
-    def set(self, obj, **kwa):
-        """
-        keyword args express internals that should be set. (id, active, etc.)
-        """
-        # What is the distinction between obj and kwa?
-        # Obj accepts internal keyspaces if _ prepended.
-        # Kwa accepts internal keyspaces only?
-
-        set_obj = {}
-
-        # Set of internal keys in kwa
-        kwa_ikeys = self._all_internal_keys.intersection(kwa.keys())
-        # Set of internal keys in obj. Since obj contains '_' prepended internal
-        # keys, this comprehension is a bit nested. There might be a shorter
-        # way.
-        obj_ikeys = {k.lstrip('_') for k in
-                        {'_'+k for k in
-                            self._all_internal_keys}.intersection(obj.keys())}
-
-        all_ikeys = kwa_ikeys | obj_ikeys
-
-        # Set default id.
-        if self.id_attr not in all_ikeys:
-            set_obj[self.id_attr] = self.__random_id_func()
-
-        # Set defaults.
-        for k, v in self.internal_defaults.items():
-            if k not in all_ikeys:
-                set_obj[k] = v
-
-
-
-        # if 'id' not in kwa and '_id' not in obj:
-        #     kwa['id'] = self.__random_id_func()
-        # elif 'id' not in kwa and '_id' in obj:
-        #     kwa['id'] = obj['_id']
-
-        # if 'active' not in kwa and '_active' not in obj:
-        #     kwa['active'] = True
-        # elif 'active' not in kwa and '_active' in obj:
-        #     kwa['active'] = obj['_active']
-
-        # Append _ to any additional items and extend in to obj.
-        # obj.update({'_%s' % k: v for k, v in kwa.items()})
-        # Hash._set(self, obj['_id'], dump_dict(obj))
-        # return obj['_id']
-
-
-    def delete(self, _id, reference=True):
-        """
-        """
-        if reference:
-            obj = self.get(_id)
-            Hash.set(self, obj, active=False)
-        else:
-            self.session.delete(Hash.gen_key(self, _id))
-
-    def delete(self, _id):
-        self.delete(_id, reference=False)
-
-
-
-
-
-class ZSet(RedisObj):
-    """
-
-    >>> import thredis
-    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
-    >>> se = thredis.ZSet('set', 'space', session=s)
-    >>> 
-    >>> se.add('set1')
-    >>> se.add('set2')
-    >>> se.add('set3')
-    >>> 
-    >>> se.session.execute()
-    [1, 1, 1]
-    >>> 
-    >>> se.all()
-    [b'set1', b'set2', b'set3']
-    >>> 
-    >>> se.insert('set1.5', 1)
-    >>> 
-    >>> se.session.execute()
-    [1, 0, 0]
-    >>> 
-    >>> se.all()
-    [b'set1', b'set1.5', b'set2', b'set3']
-    >>> 
-    """
-    def __init__(self, *args, **kwa):
-        RedisObj.__init__(self, *args, **kwa)
-        self.__dirty_count = 0
-
-    def _execute(self):
-        """ """
-        super(ZSet, self)._execute()
-        self.__dirty_count = 0
-
-    def count(self):
-        return self.session.zcard(self.gen_key()) + self.__dirty_count
-
-    def add(self, obj, score=None):
-        if not isinstance(score, float):
-            score = self.count()
-        self.session.zadd(self.gen_key(), score, obj)
-        self.__dirty_count += 1
-
-    def range(self, from_idx, to_idx):
-        return self.session.zrange(self.gen_key(), int(from_idx), int(to_idx))
-
-    def get(self, idx):
-        item = self.range(idx, idx)
-        if len(item) > 0:
-            return item[0]
-
-    def all(self):
-        return self.range(0, -1)
-
-    def delete(self, obj):
-        self.session.zrem(self.gen_key(), obj)
-        self.__dirty_count -= 1
-
-    def delete(self):
-        # TODO: Rename any other "delete" methods that aren't directly
-        #   related to removing keys or data.
-        """This will completely remove this sets namespace from Redis.
-
-        """
-        self.session.delete(self.gen_key())
-
-    def insert(self, obj, at_idx):
-        """Insert object `at_index`, reindexing all objects following."""
-        idx = float(at_idx)
-        self.session.execute() # Unfortunate hack to keep the indexing correct.
-        self.add(obj, score=idx)
-        for item in self.range(idx, -1):
-            idx += 1
-            self.add(item, score=idx)
-
-
-class Collection(RedisObj):
-    """Provides a hash and ordered set.
-
-    >>> import thredis
-    >>> 
-    >>> s = thredis.UnifiedSession.from_url('redis://127.0.0.1:6379')
-    >>> s.flushall()
-    True
-    >>> c = thredis.Collection('coll', 'space', session=s)
-    >>> 
-    >>> id = c.add({'foo': 'bars'})
-    >>> 
-    >>> c.session.execute()
-    [True, 1]
-    >>> 
-    >>> c.get(id)
-    {'foo': 'bars', '_idx': 0, '_id': UUID('3ff956ae-d36b-416b-8c83-9103a0ebc7ff')}
-    >>> 
-    >>> c.add({'foo': 'bars'})
-
-    >>> c.add({'foo': 'bars'})
-
-    >>> c.add({'foo': 'bars'})
-
-    >>> c.session.execute()
-    [True, 1, True, 1, True, 1]
-    >>> list(c.all(active_only=False))
-
-    """
-    id_attr = 'id'
-    idx_attr = 'idx'
-
-    def __init__(self, *namespace, **kwa):
-        RedisObj.__init__(self, *namespace, **kwa)
-        self.__hash = Hash(*namespace+('h', 'data'), **kwa)
-        self.__index = ZSet(*namespace+('z', 'index'), **kwa)
-        self.__inactive_index = Set(*namespace+('s', 'deleted'), **kwa)
-
-    def all_gen(self, inactive=False):
-        """Get all items in the collection and return as a generator.
-        """
-        if inactive is True:
-             id_set = self.__inactive_index.all()
-        else:
-            id_set = self.__index.all()
-        return (self.__hash.get(_id) for _id in id_set)
-
-    def all(self, **kwa):
-        return list(self.all_gen(**kwa))
-
-    def idx(self, _id, verify=True):
-        obj = self.__hash.get(_id)
-        
-        if not verify or self.__index.get(obj['_idx']) == obj['_id']:
-            return obj['_idx']
-        else:
-            # TODO: Custom exception for this. A bad one.
-            raise Exception("Inconsitency in Redis. This is bad and should never happen.")
-
-    def move(self):
-        raise NotImplementedError()
-
-    def get(self, _id):
-        return self.__hash.get(_id)
-
-    def add(self, obj, **kwa):
-
-        if 'idx' not in kwa:
-            kwa['idx'] = self.__index.count()
-        # Do hash add and then put in to set before item at `idx`.
-        _id = self.__hash.set(obj, **kwa)
-        
-        if obj['_active'] is True:
-            self.__index.insert(_id, kwa['idx'])
-        elif obj['_active'] is False:
-            self.__inactive_index.add(_id)
-        else:
-            raise ValueError("`active` is not set correctly." % obj['_active'])
-
-        return {'_id': obj['_id']}
-
-    def delete(self):
-        """Removes this entire collection from Redis."""
-        self.__active_index.delete()
-        for _id in self.__index:
-            self.__hash.delete(_id)
-        self.__index.delete()
-
-    def delete(self, _id, **kwa):
-        print('model delete.')
-        if kwa.get('reference', True) is True:
-            self.__index.delete(_id)
-            self.__hash.delete(_id, **kwa)
-            self.__inactive_index.add(_id)
-            return True
-        else:
-            raise NotImplementedError()
-
-
-            '''
