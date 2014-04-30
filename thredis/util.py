@@ -32,16 +32,23 @@ binencode = base64.b64encode
 
 threadfunc = lambda f: threading.Thread(target=f).start()
 
-__all__ = ('threadfunc', 'nonce', 'nonce_n', 'nonce_h', 'nonce_nh', 'HashableOrderedDict',
+__all__ = ('threadfunc', 'nonce', 'HashableOrderedDict',
             'JsonEncoder', 'JsonDecoder', 'json', 'ModelLoopThread')
 
 
-NONCE_ATOM = 16 
 
+# 16 byte nonce. period.
+nonce = lambda: hashlib.md5(os.urandom(16 ** 2)).digest()
+
+
+
+'''
+# This is all silly.
+NONCE_ATOM = 16 
 nonce = lambda: open('/dev/random', 'rb').read(NONCE_ATOM)
 nonce_n = lambda n: open('/dev/random', 'rb').read(NONCE_ATOM * n)
 nonce_h = lambda: hashlib.sha256(os.urandom(NONCE_ATOM ** 2)).digest()
-nonce_nh = lambda n: hashlib.sha256(os.urandom(NONCE_ATOM ** n)).digest()
+nonce_nh = lambda n: hashlib.sha256(os.urandom(NONCE_ATOM ** n)).digest()'''
 
 
 # Unused but saved for reference.

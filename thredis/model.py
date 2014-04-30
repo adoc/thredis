@@ -7,8 +7,8 @@ import threading
 import base64
 import time
 import uuid
-from thredis import UnifiedSession
-from thredis.util import json, nonce_h
+import thredis
+import thredis.util
 
 from safedict import SafeDict
 
@@ -108,7 +108,7 @@ class RedisObj:
             return self._namespace
 
     def bind(self, session):
-        if isinstance(session, UnifiedSession):
+        if isinstance(session, thredis.UnifiedSession):
             self.__session = session
             self.__session.bind_exec_event(self._execute)
         else:
@@ -154,22 +154,22 @@ class RedisObj:
     def _ingress(val):
         """Ingress data."""
         if isinstance(val, bytes):
-            return json.loads(val.decode())
+            return thredis.util.json.loads(val.decode())
 
         elif isinstance(val, list):
-            return [json.loads(v.decode()) for v in val if v is not None]
+            return [thredis.util.json.loads(v.decode()) for v in val if v is not None]
 
         elif isinstance(val, tuple):
-            return tuple([json.loads(v.decode()) for v in val if v is not None])
+            return tuple([thredis.util.json.loads(v.decode()) for v in val if v is not None])
 
         elif isinstance(val, set):
-            return set([json.loads(v.decode()) for v in val if v is not None])
+            return set([thredis.util.json.loads(v.decode()) for v in val if v is not None])
 
         elif isinstance(val, dict):
-            return json.loadd(val)
+            return thredis.util.json.loadd(val)
 
         elif val:
-            return json.loads(val)
+            return thredis.util.json.loads(val)
 
     @staticmethod
     def _egress(*args):
@@ -177,9 +177,7 @@ class RedisObj:
         #   check implementation again.
 
         # Used as *arglist
-        return tuple([json.dumps(val) for val in args])
-
-
+        return tuple([thredis.util.json.dumps(val) for val in args])
 
 
 class String(RedisObj):
@@ -252,18 +250,13 @@ class Lock(RedisObj):
         -- Attempt to release the lock.
         local resource_key = KEYS[1]
         local key = "lock:" .. resource_key
-        local token = ARGV[1]
-        if redis.call("GET", key) == token then
+        local nonce = ARGV[1]
+        if redis.call("GET", key) == nonce then
             return redis.call("DEL", key)
         else
             return nil
         end
     """
-    
-    # Set lock
-    # SET resource-name anystring NX EX max-lock-time
-    # Unset Lock (Called by whom?)
-    # EVAL ...script... 1 resource-name token-value
 
     nonces_key = 'nonces'
 
@@ -271,40 +264,26 @@ class Lock(RedisObj):
     #   timeout. This must NEVER happen.
 
     def __init__(self, *namespace, session=None, type_in_namespace=False,
-                 timeout_ms=5000, gen_id=False, id=None): 
+                 timeout_ms=5000): 
         RedisObj.__init__(self, *namespace, session=session,
                           type_in_namespace=type_in_namespace)
         self._timeout = timeout_ms # deadlock timeout
         self._lua_acquire = self.session.register_script(self.l_acquire_lock)
         self._lua_release = self.session.register_script(self.l_release_lock)
-        self._gen_id = gen_id
-        self._id = id
 
     @property
     def ts(self):
         model = String('lock_ts', *self._namespace, session=self.session,
-                        type_in_namespace=False)
+                       type_in_namespace=False)
         key, val = model._get()
         return float(val)
 
-    def acquire(self):
-        if self._gen_id is True:
-            # Testing only. Use Nonce generator and gen_id=False.
-            nonce = nonce512()
-            if self.session.client.set('lock:'+self.gen_key(), nonce, nx=True,
-                        px=self._timeout):
-                return self._id
-        else:
-            # The id of this lock is assigned by redis via the `nonces_key`
-            nonce = self._id = self._lua_acquire(keys=[self.gen_key(), self.nonces_key],
-                                 args=[self._timeout, time.time()])
-            return nonce
+    def acquire(self, id_):
+        return  self._lua_acquire(keys=[self.gen_key(id_), self.nonces_key],
+                                  args=[self._timeout, time.time()])
 
-        # Did not acquire the lock
-        return False
-
-    def release(self):
-        return self._lua_release(keys=[self.gen_key()], args=[self._id])
+    def release(self, id_, nonce):
+        return self._lua_release(keys=[self.gen_key(id_)], args=[nonce])
 
 
 class List(RedisObj):
@@ -480,7 +459,7 @@ class Hash(RedisObj):
 
     @staticmethod
     def _egress(obj):
-        return json.dumpd(obj)
+        return thredis.util.json.dumpd(obj)
 
     # Low functions
     def r_get(self, key, *fields):
@@ -755,16 +734,15 @@ class Record(ModelObject):
 
 
 class Nonces(List):
+    """
+    """
     def __init__(self, *namespace, session=None, type_in_namespace=False):
         List.__init__(self, *namespace, session=session,
-            type_in_namespace=type_in_namespace)
+                      type_in_namespace=type_in_namespace)
 
     def gen(self, n):
         for _ in range(n):
-            #rnd = base64.b64encode(nonce(self.size)).decode()
-            #rnd = rnd[:self._size]
-            #assert len(rnd) == self._size
-            self._rpush(nonce_h())
+            self._rpush(thredis.util.nonce())
 
     def count(self):
         key, val = self._count()
