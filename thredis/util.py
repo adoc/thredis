@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 import os
 import time
+import base64
 import threading
 import hashlib
 import collections
@@ -26,8 +27,12 @@ except ImportError:
     log.warn("Pytz not installed. Some functionality in will be affected.")
     pytz = None
 
+binencode = base64.b64encode
 
-__all__ = ('nonce', 'nonce_n', 'nonce_h', 'nonce_nh', 'HashableOrderedDict',
+
+threadfunc = lambda f: threading.Thread(target=f).start()
+
+__all__ = ('threadfunc', 'nonce', 'nonce_n', 'nonce_h', 'nonce_nh', 'HashableOrderedDict',
             'JsonEncoder', 'JsonDecoder', 'json', 'ModelLoopThread')
 
 
@@ -87,7 +92,11 @@ class JsonEncoder(_json.JSONEncoder):
         if isinstance(obj, uuid.UUID):
             return obj.urn
         if isinstance(obj, bytes):
-            obj = obj.decode()
+            try:
+                obj = obj.decode()
+            except UnicodeDecodeError:
+                obj = binencode(obj).decode()
+                return _json.dumps(obj)
         return _json.JSONEncoder.default(self, obj)
 
 
@@ -171,6 +180,7 @@ class ModelLoopThread(threading.Thread):
         self.model = model
         self.session = session
         self._throttle = self._throttle or float(throttle_ms/1000.0)
+        self._stack = 0
 
     def _callback(self):
         raise NotImplementedError("Subclass ModelLoop to implement!")
@@ -180,9 +190,14 @@ class ModelLoopThread(threading.Thread):
 
     def run(self):
         while True:
-            self._nini()
-            self._callback()
-            if self.session:
-                self.session.execute()
-            elif self.model:
-                self.model.session.execute()
+            if self._stack < 1:
+                self._nini()
+                self._stack += 1
+                self._callback()
+                self._stack -= 1
+                if self.session:
+                    self.session.execute()
+                elif self.model:
+                    self.model.session.execute()
+            else:
+                print("skip")

@@ -175,7 +175,7 @@ class UnifiedSession(ThreadLocalRedisPool):
                             # All keys
                             'delete',
                             # String
-                            'set'
+                            'set', 'incrby', 'pexpire',
                             # Lists
                             'lset', 'linsert', 'lpush',
                             'rpush',
@@ -187,7 +187,7 @@ class UnifiedSession(ThreadLocalRedisPool):
                             'zadd', 'zrem')
 
     client_commands = (
-                        'keys',
+                        'keys', 'register_script',
                         # Strings
                         'get',
                         # Lists
@@ -199,7 +199,9 @@ class UnifiedSession(ThreadLocalRedisPool):
                         # Sets
                         'smembers', 'scard', 'sismember',
                         # Sorted Sets
-                        'zrange', 'zrevrange', 'zcard', 'zrangebyscore')
+                        'zcard', 'zscore',
+                        'zrange', 'zrevrange',
+                        'zrangebyscore', 'zrevrangebyscore')
 
     debug_commands = ('flushdb', 'info')
 

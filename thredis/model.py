@@ -8,7 +8,7 @@ import base64
 import time
 import uuid
 from thredis import UnifiedSession
-from thredis.util import json, nonce_nh
+from thredis.util import json, nonce_h
 
 from safedict import SafeDict
 
@@ -16,6 +16,17 @@ __all__ = ('UnboundModelException', 'ConstraintFailed', 'UniqueFailed',
             'RedisObj',
             'String', 'List', 'Set', 'ZSet', 'Hash',
             'ModelObject', 'Record', 'Nonces')
+
+def timedec(func):
+    def innerfunc(*args, **kwa):
+        t0=time.time()
+        try:
+            return func(*args,  **kwa)
+        finally:
+            name = func.__name__
+            print("func `%s` timing: %s" % (name, time.time()-t0))
+    return innerfunc
+
 
 
 class UnboundModelException(Exception):
@@ -32,11 +43,29 @@ class UniqueFailed(ConstraintFailed):
     pass
 
 
+class PassThrough:
+    @staticmethod
+    def _ingress(obj):
+        return obj
+    @staticmethod
+    def _egress(*obj):
+        return obj
+
+
 # TODO: Move these originally in "model" to "primal"
 class RedisObj:
     keyspace_separator = ':'
 
-    def __init__(self, *namespace, session=None, type_in_namespace=True):
+    l_copy = """
+    -- Atomic Redis Copy.
+    local source_key = KEYS[1]
+    local dest_key = KEYS[2]
+    local data = redis.call('DUMP', source_key)
+    return redis.call('RESTORE', dest_key, data)
+    """
+
+    def __init__(self, *namespace, session=None, type_in_namespace=True,
+                 pass_through=False):
         self.__session = None
         self.__type_in_namespace = type_in_namespace # Include the type class name in the namespace
         if session:
@@ -45,6 +74,15 @@ class RedisObj:
             raise ValueError('`RedisObj` requires at least one namespace '
                              'argument.')
         self._namespace = namespace
+        if pass_through is True:
+            # Apply PassThrough functions to this instance.
+            for attr,val in PassThrough.__dict__.items():
+                if not attr.startswith('__'):
+                    if isinstance(val, staticmethod):
+                        val = val.__func__
+                    setattr(self, attr, val)
+
+        self.lua_copy = self.session.register_script(self.l_copy)
         log.debug("RedisObj instantiated. namespace: %s" %
                                                 (':'.join(self._namespace)))
 
@@ -92,6 +130,11 @@ class RedisObj:
         return self.keyspace_separator.join(self.namespace +
                                                 tuple(suffix))
 
+    def copy(self, target_model):
+        source_key = self.gen_key()
+        dest_key = target_model.gen_key()
+        return self.lua_copy(keys=[source_key, dest_key])
+
     def __del__(self):
         pass
 
@@ -116,6 +159,9 @@ class RedisObj:
         elif isinstance(val, list):
             return [json.loads(v.decode()) for v in val if v is not None]
 
+        elif isinstance(val, tuple):
+            return tuple([json.loads(v.decode()) for v in val if v is not None])
+
         elif isinstance(val, set):
             return set([json.loads(v.decode()) for v in val if v is not None])
 
@@ -132,6 +178,8 @@ class RedisObj:
 
         # Used as *arglist
         return tuple([json.dumps(val) for val in args])
+
+
 
 
 class String(RedisObj):
@@ -227,8 +275,8 @@ class Lock(RedisObj):
         RedisObj.__init__(self, *namespace, session=session,
                           type_in_namespace=type_in_namespace)
         self._timeout = timeout_ms # deadlock timeout
-        self._lua_acquire = self.session.client.register_script(self.l_acquire_lock)
-        self._lua_release = self.session.client.register_script(self.l_release_lock)
+        self._lua_acquire = self.session.register_script(self.l_acquire_lock)
+        self._lua_release = self.session.register_script(self.l_release_lock)
         self._gen_id = gen_id
         self._id = id
 
@@ -462,24 +510,34 @@ class ZSet(RedisObj):
     """
     """
     def __init__(self, *namespace, session=None, type_in_namespace=True,
-                    asc=False):
+                 pass_through=False, asc=False):
         RedisObj.__init__(self, *namespace, session=session,
-                            type_in_namespace=type_in_namespace)
+                          pass_through=pass_through,
+                          type_in_namespace=type_in_namespace)
         self._asc=asc
 
-    def _range(self, from_idx, to_idx, withscores=False):
+    def _range(self, from_idx, to_idx, reversed=False, withscores=False):
         key = self.gen_key()
-        zrange = (self._asc and self.session.zrange or self.session.zrevrange)
+        direction = reversed and not self._asc or self._asc
+        zrange = (direction and self.session.zrange or self.session.zrevrange)
         return key, zrange(key, int(from_idx), int(to_idx),
                             withscores=withscores)
 
-    def _all(self, withscores=False):
-        return self._range(0, -1, withscores=withscores)
+    def _rangebyscore(self, min_, max_, reversed=False, withscores=False):
+        key = self.gen_key()
+        direction = reversed and not self._asc or self._asc
+        zrangebyscore = (direction and self.session.zrangebyscore or
+                         self.session.zrevrangebyscore)
+        return key, zrangebyscore(key, max_, min_,
+                                  withscores=withscores)
 
-    def _get(self, idx, withscores=False):
-        return self._range(idx, idx, withscores=withscores)
+    def _all(self, reversed=False, withscores=False):
+        return self._range(0, -1, reversed=reversed, withscores=withscores)
 
-    def _add(self, obj, score):
+    def _get(self, idx, reversed=False, withscores=False):
+        return self._range(idx, idx, reversed=reversed, withscores=withscores)
+
+    def _add(self, obj, score=None):
         key = self.gen_key()
         return key, self.session.zadd(key, score, obj)
 
@@ -487,26 +545,68 @@ class ZSet(RedisObj):
         key = self.gen_key()
         return key, self.session.zrem(key, obj)
 
+    def _score(self, obj):
+        key = self.gen_key()
+        return key, self.session.zscore(key, obj)
+
     def _count(self):
         key = self.gen_key()
         return key, self.session.zcard(key)
 
-
+    # API
     def count(self):
         return self._count()
 
-    def range(self, from_idx, to_idx):
-        return self._ingress(self._range(from_idx, to_idx,
-                                            withscores=True))
+    def range(self, from_idx, to_idx, reversed=False, withscores=False):
+        key, lst = self._range(from_idx, to_idx, reversed=reversed,
+                               withscores=withscores)
+        if withscores is True:
+            vals, scores = zip(*lst)
+            return tuple(zip(self._ingress(vals), scores))
+        else:
+            return self._ingress(lst)
 
-    def all(self, withscores=False):
-        return self._ingress(self._range(0, -1, withscores=withscores))
+    def rangebyscore(self, min_, max_, reversed=False, withscores=False):
+        key, lst = self._rangebyscore(min_, max_, reversed=reversed,
+                                      withscores=withscores)
+        if withscores is True:
+            vals, scores = zip(*lst)
+            return tuple(zip(self._ingress(vals), scores))
+        else:
+            return self._ingress(lst)
 
-    def get(self, idx, withscores=False):
-        return self._ingress(self._get(idx, withscores=withscores))
+    def all(self, reversed=False, withscores=False):
+        key, lst = self._all(reversed=reversed, withscores=withscores)
 
-    def add(self, obj, score):
-        return self._add(*self._egress(obj), score)
+        if withscores is True:
+            vals, scores = zip(*lst)
+            return tuple(zip(self._ingress(vals), scores))
+        else:
+            return self._ingress(lst)
+
+    def get(self, idx, reversed=False, withscores=False):
+        key, vals = self._get(idx,
+                                       reversed=reversed,
+                                       withscores=withscores)
+        if vals:
+            val = vals[0]
+
+            if withscores is True:
+                val,score = val
+                return (self._ingress(val), score)
+            else:
+                return self._ingress(val)
+
+
+    def getbyscore(self, score, reversed=False, withscores=False):
+        return self.rangebyscore(score, score, reversed=reversed,
+                                 withscores=withscores)
+
+    def score(self, obj):
+        return self._score(*self._egress(obj))
+
+    def add(self, obj, score=None):
+        return self._add(*self._egress(obj), score=score)
 
     def delete(self, obj):
         return self._delete(*self._egress(obj))
@@ -664,7 +764,7 @@ class Nonces(List):
             #rnd = base64.b64encode(nonce(self.size)).decode()
             #rnd = rnd[:self._size]
             #assert len(rnd) == self._size
-            self._rpush(nonce_nh(3))
+            self._rpush(nonce_h())
 
     def count(self):
         key, val = self._count()
