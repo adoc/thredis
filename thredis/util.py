@@ -37,8 +37,8 @@ __all__ = ('threadfunc', 'nonce', 'HashableOrderedDict',
 
 
 
-# 16 byte nonce. period.
-nonce = lambda: hashlib.md5(os.urandom(16 ** 2)).digest()
+# 20 byte nonce. period.
+nonce = lambda: hashlib.sha1(os.urandom(512 * 20)).digest()
 
 
 
