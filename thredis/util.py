@@ -21,6 +21,8 @@ import datetime
 import uuid
 import json as _json
 
+from safedict import SafeDict as safedict
+
 try:
     import pytz
 except ImportError:
@@ -32,7 +34,7 @@ binencode = base64.b64encode
 
 threadfunc = lambda f: threading.Thread(target=f).start()
 
-__all__ = ('threadfunc', 'nonce', 'HashableOrderedDict',
+__all__ = ('safedict',  'threadfunc', 'nonce', 'HashableOrderedDict',
             'JsonEncoder', 'JsonDecoder', 'json', 'ModelLoopThread')
 
 

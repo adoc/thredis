@@ -56,6 +56,7 @@ class PassThrough:
 class RedisObj:
     keyspace_separator = ':'
 
+    # copied to util.lua
     l_copy = """
     -- Atomic Redis Copy.
     local source_key = KEYS[1]
