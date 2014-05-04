@@ -158,13 +158,16 @@ class RedisObj:
             return thredis.util.json.loads(val.decode())
 
         elif isinstance(val, list):
-            return [thredis.util.json.loads(v.decode()) for v in val if v is not None]
+            return [thredis.util.json.loads(v.decode())
+                        for v in val if v is not None]
 
         elif isinstance(val, tuple):
-            return tuple([thredis.util.json.loads(v.decode()) for v in val if v is not None])
+            return tuple([thredis.util.json.loads(v.decode())
+                            for v in val if v is not None])
 
         elif isinstance(val, set):
-            return set([thredis.util.json.loads(v.decode()) for v in val if v is not None])
+            return set([thredis.util.json.loads(v.decode())
+                            for v in val if v is not None])
 
         elif isinstance(val, dict):
             return thredis.util.json.loadd(val)
@@ -181,312 +184,211 @@ class RedisObj:
         return tuple([thredis.util.json.dumps(val) for val in args])
 
 
-class String(RedisObj):
+class _String(RedisObj):
+    """String Objects Adapter
     """
-    """
-    def _get(self):
-        key = self.gen_key()
+    # TODO: Add relevant LUAs. util.lua, etc.
+    def get(self, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.get(key)
 
-    def _set(self, val):
-        key = self.gen_key()
+    def set(self, val, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.set(key, val)
 
-    # API functions
-    def get(self):
-        key, raw = self._get()
-        return {'key': key,
-                'obj': self._ingress(raw),
-                'raw': raw}
-
-    def set(self, value):
-        key, raw = self._set(*self._egress(value))
-        return {'key': key,
-                'obj': value,
-                'raw': raw}
-
-    def delete(self):
-        key = self.gen_key()
-        return {'key': key,
-                'raw': self.session.delete(key)}
+    def delete(self, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.delete(key)
 
 
-class Lock(RedisObj):
-    """Simple Lock Primitive based on http://redis.io/commands/set. We also
-    use LUA for speed here in dealing with the nonces. Nonces are usually added by a daemon to the
-    `nonces_key`."""
+class String(_String):
+    def get(self, **kwa):
+        key, raw = _String.get(self, **kwa)
+        return key, self._ingress(raw)
 
-    l_acquire_lock = """
-        -- Attempt to acquire a lock on resource_key
-        local resource_key = KEYS[1]
-        local nonces_key = KEYS[2]
-        local nonce = redis.call("LPOP", nonces_key)
-        local timeout_ms = tostring(ARGV[1])
-        local timestamp = tostring(ARGV[2])
-        local lock_key = "lock:" .. resource_key
-        local lock_key_ts = "lock_ts:" .. resource_key
-        -- Set lock to nonce(id) with deadlock timeout_ms.
-        if nonce then
-            if redis.call("SET", lock_key, nonce, "NX", "PX", timeout_ms) then
-                -- We got the lock, set the timestamp and return the NONCE.
-                redis.call("SET", lock_key_ts, timestamp, "PX", timeout_ms)
-                return nonce
-            else
-                -- We got a nonce, but could not get the lock, return FALSE.
-                return false
-            end
-        else
-            -- No nonce available, return NIL.
-            return nil
-        end
+    def set(self, value, **kwa):
+        key, raw = _String.set(self, *self._egress(value), **kwa)
+        return key, raw
+
+    def delete(self, **kwa):
+        key, raw = _String.delete(self, **kwa)
+        return key, raw
+
+
+class _List(RedisObj):
+    """List Object Adapter
     """
-
-    # Not sure I need this.
-    l_check_lock = """
-        -- Verify this nonce has the lock. This should help with deadlock
-        --   expiring locks but process still thinks it has the lock?
-    """
-
-    l_release_lock = """
-        -- Attempt to release the lock.
-        local resource_key = KEYS[1]
-        local key = "lock:" .. resource_key
-        local nonce = ARGV[1]
-        if redis.call("GET", key) == nonce then
-            return redis.call("DEL", key)
-        else
-            return nil
-        end
-    """
-
-    nonces_key = 'nonces'
-
-    #race condition exists where the process takes longer than the deadlock
-    #   timeout. This must NEVER happen.
-
-    def __init__(self, *namespace, session=None, type_in_namespace=False,
-                 timeout_ms=5000): 
-        RedisObj.__init__(self, *namespace, session=session,
-                          type_in_namespace=type_in_namespace)
-        self._timeout = timeout_ms # deadlock timeout
-        self._lua_acquire = self.session.register_script(self.l_acquire_lock)
-        self._lua_release = self.session.register_script(self.l_release_lock)
-
-    @property
-    def ts(self):
-        model = String('lock_ts', *self._namespace, session=self.session,
-                       type_in_namespace=False)
-        key, val = model._get()
-        return float(val)
-
-    def acquire(self, id_):
-        return  self._lua_acquire(keys=[self.gen_key(id_), self.nonces_key],
-                                  args=[self._timeout, time.time()])
-
-    def release(self, id_, nonce):
-        return self._lua_release(keys=[self.gen_key(id_)], args=[nonce])
-
-
-class List(RedisObj):
-    """
-    """
-
-    # Low functions
-    def _count(self):
-        key = self.gen_key()
+    def count(self, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.llen(key)
 
-    def _range(self, from_idx, to_idx):
-        key = self.gen_key()
+    def range(self, from_idx, to_idx, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.lrange(key, from_idx, to_idx)
 
-    def _lpush(self, *objs):
-        key = self.gen_key()
+    def lpush(self, *objs, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.lpush(key, *objs)
 
-    def _rpush(self, *objs):
-        key = self.gen_key()
+    def rpush(self, *objs, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.rpush(key, *objs)
 
-    def _set(self, idx, obj):
-        key = self.gen_key()
+    def set(self, idx, obj, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.lset(key, idx, obj)
 
-    def _lpop(self):
-        key = self.gen_key()
+    def lpop(self, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.lpop(key)
 
-    def _blpop(self):
-        key = self.gen_key()
+    def blpop(self, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.blpop(key)
 
-    def _rpop(self):
-        key = self.gen_key()
+    def rpop(self, keyspace=()):
+        key = self.gen_key(*keyspace)
         return key, self.session.rpop(key)
 
-    def _linsert(self, pivot, value, before=None, after=None):
-        key = self.gen_key()
-        return key, self.session.linsert(key, pivot, value, before=before, after=after)
+    # Not API implemented yet.
+    def linsert(self, pivot, value, before=None, after=None, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.linsert(key, pivot, value, before=before,
+                                         after=after)
 
-
-    # API functions
-    def all(self):
-        """Get all in list."""
-        # return self._ingress(self.r_range(0, -1))
-        key, raw = self._range(0, -1)
-        return {'key': key,
-                'obj': self._ingress(raw),
-                'raw': raw}
-
-    def count(self):
+class List(_List):
+    """
+    """
+    def count(self, **kwa):
         """Return list count/length."""
-        key, raw = self._count()
-        return {'key': key,
-                'raw': raw}
+        key, raw = self._count(**kwa)
+        return key, raw
 
-    def lpush(self, *objs):
+    def range(self, from_idx, to_idx, **kwa):
+        key, raw = _List.range(self, from_idx, to_idx, **kwa)
+        return key, self.ingress(raw)
+
+    def all(self, **kwa):
+        """Get all in list."""
+        key, raw = _List.range(self, 0, -1, **kwa)
+        return key, self._ingress(raw)
+
+    def lpush(self, *objs, **kwa):
         """Insert obj(s) at start of list."""
-        #return self.r_lpush(*self._egress(*objs))
-        key, raw = self._lpush(*self._egress(*objs))
-        return {'key': key,
-                'obj': objs,
-                'raw': raw}
+        key, raw = _List.lpush(self, *self._egress(*objs), **kwa)
+        return key, raw
 
-    def rpush(self, *objs):
+    def rpush(self, *objs, **kwa):
         """Insert obj(s) at end of list."""
-        #return self.r_rpush(*self._egress(*objs))
-        key, raw = self._rpush(*self._egress(*objs))
-        return {'key': key,
-                'obj': objs,
-                'raw': raw}
+        key, raw = _List.rpush(self, *self._egress(*objs), **kwa)
+        return key, raw
 
-    def set(self, idx, obj):
+    def set(self, idx, obj, **kwa):
         """Set list item at `idx` to `obj`."""
-        # return self.r_set(idx, *self._egress(obj))
-        key, raw = self._set(idx, *self._egress(obj))
-        return {'key': key,
-                'obj': obj,
-                'raw': raw}
+        key, raw = _List.set(self, idx, *self._egress(obj), **kwa)
+        return key, raw
 
-    def get(self, idx):
+    def get(self, idx, **kwa):
         """Get list item at `idx`."""
-        #return self._ingress(self.r_range(idx, idx))
-        key, raw = self._range(idx, idx)
-        return {'key': key,
-                'obj': self._ingress(raw),
-                'raw': raw}
+        key, raw = _List.range(self, idx, idx, **kwa)
+        return key, self._ingress(raw)
 
-    def lpop(self):
+    def lpop(self, **kwa):
         """Get first list item and remove it."""
-        #return self._ingress(self.r_lpop())
-        key, raw = self._lpop()
-        return {'key': key,
-                'obj': self._ingress(raw),
-                'raw': raw}
+        key, raw = _List.lpop(self, **kwa)
+        return key, self._ingress(raw)
 
-    def rpop(self):
+    def rpop(self, **kwa):
         """Get last list item and remove it."""
-        #return self._ingress(self.r_rpop())
-        key, raw = self._rpop()
-        return {'key': key,
-                'obj': self._ingress(raw),
-                'raw': raw}
-
-    '''
-    # Don't need or use?
-    def before(self, pivot, value):
-        """ """
-        #return self.r_linsert(self._egress(pivot),
-        #                      self._egress(value), before=True)
-        return {'key': key,
-                'obj': value,
-                'raw': self._linsert(self._egress(pivot),
-                              self._egress(value), before=True)}
-
-    def after(self, pivot, value):
-        """ """
-        #return self.r_linsert(self._egress(pivot),
-        #                      self._egress(value), after=True)
-        return {'key': key,
-                'obj': value,
-                'raw': self._linsert(self._egress(pivot),
-                              self._egress(value), after=True)}
-    '''
+        key, raw = _List._rpop(self, **kwa)
+        return key, self._ingress(raw)
 
 
-class Set(RedisObj):
+class _Set(RedisObj):
     """
     """
+    def count(self, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.scard(key)
 
-    def _all(self):
-        key = self.gen_key()
-        return self.session.smembers(key)
+    def all(self, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.smembers(key)
 
-    def _add(self, *objs):
-        key = self.gen_key()
-        return self.session.sadd(key, *objs)
+    def add(self, *objs, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.sadd(key, *objs)
 
-    def _ismember(self, obj):
-        key = self.gen_key()
-        return self.session.sismember(key, obj)
+    def ismember(self, obj, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.sismember(key, obj)
 
-    def _delete(self, *objs):
-        key = self.gen_key()
-        return self.session.srem(key, *objs)
+    def delete(self, *objs, keyspace=()):
+        key = self.gen_key(*keyspace)
+        return key, self.session.srem(key, *objs)
 
+class Set(_Set):
     #Api functions.
-    def count(self):
-        key = self.gen_key()
-        return self.session.scard(key)
-        return {'key': key,
-                }
+    def count(self, **kwa):
+        key, raw = _Set.count(self, **kwa)
+        return key, raw
 
-    def all(self):
-        return self._ingress(self.r_all())
+    def all(self, **kwa):
+        key, raw = _Set.all(self, **kwa)
+        return key, self._ingress(raw)
 
-    def add(self, *objs):
-        return self.r_add(*self._egress(*objs))
+    def add(self, *objs, **kwa):
+        key, raw = _Set.add(self, *self._egress(*objs), **kwa)
+        return key, raw
 
-    def ismember(self, obj):
-        return self.r_ismember(*self._egress(obj))
+    def ismember(self, obj, **kwa):
+        key, raw = _Set.ismember(self, *self._egress(obj), **kwa)
+        return key, raw
 
-    def delete(self, *objs):
-        return self.r_delete(*self._egress(*objs))
+    def delete(self, *objs, **kwa):
+        return _Set.delete(self, *self._egress(*objs), **kwa)
 
 
-class Hash(RedisObj):
+class _Hash(RedisObj):
     """
     """
+    def get(self, id_, *fields, keyspace=()):
+        key = self.gen_key(*keyspace+(id_,))
+        if fields:
+            return key, self.session.hmget(key, *fields)
+        else:
+            return key, self.session.hgetall(key)
 
+    def set(self, id_, obj, keyspace=()):
+        key = self.gen_key(*keyspace+(id_,))
+        return key, self.session.hmset(key, obj)
+
+    def delete(self, id_, keyspace=()):
+        key = self.gen_key(*keyspace+(id_,))
+        return key, self.session.delete(key)
+
+
+class Hash(_Hash):
+    """
+    """
     @staticmethod
     def _egress(obj):
         return thredis.util.json.dumpd(obj)
 
-    # Low functions
-    def r_get(self, key, *fields):
-        key = self.gen_key(key)
-        if fields:
-            return self.session.hmget(key, *fields)
-        else:
-            return self.session.hgetall(key)
+    def get(self, id_, *fields, **kwa):
+        key, raw =_Hash.get(self, id_, *fields, **kwa)
+        return key, self._ingress(raw)
 
-    def r_set(self, key, obj):
-        key = self.gen_key(key)
-        return self.session.hmset(key, obj)
+    def set(self, id_, obj, **kwa):
+        key, raw = _Hash.set(self, id_, self._egress(obj), **kwa)
+        return key, raw
 
-    # API functions
-    def get(self, key, *fields):
-        return self._ingress(self.r_get(key, *fields))
-
-    def set(self, key, obj):
-        return self.r_set(key, self._egress(obj))
-
-    def delete(self, key):
-        key = self.gen_key(key)
-        return self.session.delete(key)
+    def delete(self, id_, **kwa):
+        key, raw = _Hash._delete(self, id_, **kwa)
+        return key, raw
 
 
-class ZSet(RedisObj):
+class _ZSet(RedisObj):
     """
     """
     def __init__(self, *namespace, session=None, type_in_namespace=True,
@@ -496,14 +398,14 @@ class ZSet(RedisObj):
                           type_in_namespace=type_in_namespace)
         self._asc=asc
 
-    def _range(self, from_idx, to_idx, reversed=False, withscores=False):
+    def range(self, from_idx, to_idx, reversed=False, withscores=False):
         key = self.gen_key()
         direction = reversed and not self._asc or self._asc
         zrange = (direction and self.session.zrange or self.session.zrevrange)
         return key, zrange(key, int(from_idx), int(to_idx),
                             withscores=withscores)
 
-    def _rangebyscore(self, min_, max_, reversed=False, withscores=False):
+    def rangebyscore(self, min_, max_, reversed=False, withscores=False):
         key = self.gen_key()
         direction = reversed and not self._asc or self._asc
         zrangebyscore = (direction and self.session.zrangebyscore or
@@ -511,34 +413,37 @@ class ZSet(RedisObj):
         return key, zrangebyscore(key, max_, min_,
                                   withscores=withscores)
 
-    def _all(self, reversed=False, withscores=False):
-        return self._range(0, -1, reversed=reversed, withscores=withscores)
+    def all(self, reversed=False, withscores=False):
+        return self.range(0, -1, reversed=reversed, withscores=withscores)
 
-    def _get(self, idx, reversed=False, withscores=False):
-        return self._range(idx, idx, reversed=reversed, withscores=withscores)
+    def get(self, idx, reversed=False, withscores=False):
+        return self.range(idx, idx, reversed=reversed, withscores=withscores)
 
-    def _add(self, obj, score=None):
+    def add(self, obj, score=None):
         key = self.gen_key()
         return key, self.session.zadd(key, score, obj)
 
-    def _delete(self, obj):
+    def delete(self, obj):
         key = self.gen_key()
         return key, self.session.zrem(key, obj)
 
-    def _score(self, obj):
+    def score(self, obj):
         key = self.gen_key()
         return key, self.session.zscore(key, obj)
 
-    def _count(self):
+    def count(self):
         key = self.gen_key()
         return key, self.session.zcard(key)
 
-    # API
+
+class ZSet(_ZSet):
+    """
+    """
     def count(self):
-        return self._count()
+        return key, _ZSet.count(self)
 
     def range(self, from_idx, to_idx, reversed=False, withscores=False):
-        key, lst = self._range(from_idx, to_idx, reversed=reversed,
+        key, lst = _ZSet.range(self, from_idx, to_idx, reversed=reversed,
                                withscores=withscores)
         if withscores is True:
             vals, scores = zip(*lst)
@@ -547,7 +452,7 @@ class ZSet(RedisObj):
             return self._ingress(lst)
 
     def rangebyscore(self, min_, max_, reversed=False, withscores=False):
-        key, lst = self._rangebyscore(min_, max_, reversed=reversed,
+        key, lst = _ZSet.rangebyscore(self, min_, max_, reversed=reversed,
                                       withscores=withscores)
         if withscores is True:
             vals, scores = zip(*lst)
@@ -556,7 +461,7 @@ class ZSet(RedisObj):
             return self._ingress(lst)
 
     def all(self, reversed=False, withscores=False):
-        key, lst = self._all(reversed=reversed, withscores=withscores)
+        key, lst = _ZSet.all(self, reversed=reversed, withscores=withscores)
 
         if withscores is True:
             vals, scores = zip(*lst)
@@ -565,7 +470,7 @@ class ZSet(RedisObj):
             return self._ingress(lst)
 
     def get(self, idx, reversed=False, withscores=False):
-        key, vals = self._get(idx,
+        key, vals = _ZSet.get(self, idx,
                                        reversed=reversed,
                                        withscores=withscores)
         if vals:
@@ -583,13 +488,62 @@ class ZSet(RedisObj):
                                  withscores=withscores)
 
     def score(self, obj):
-        return self._score(*self._egress(obj))
+        return _ZSet.score(self, *self._egress(obj))
 
     def add(self, obj, score=None):
-        return self._add(*self._egress(obj), score=score)
+        return _ZSet.add(self, *self._egress(obj), score=score)
 
     def delete(self, obj):
-        return self._delete(*self._egress(obj))
+        return _ZSet.delete(self, *self._egress(obj))
+
+
+class Nonces(_List):
+    """
+    * No ingress or egress json. This is meant to be super fast.
+    """
+    def __init__(self, *namespace, session=None, type_in_namespace=False):
+        List.__init__(self, *namespace, session=session,
+                      type_in_namespace=type_in_namespace)
+
+    def gen(self, n):
+        for _ in range(n):
+            _List.rpush(self, thredis.util.nonce())
+
+    def count(self):
+        key, val = _List.count(self)
+        return val
+
+    def get(self):
+        key, val = _List.blpop(self)
+        return val
+
+
+# Advanced types.
+class Lock(RedisObj):
+    """Simple Lock Primitive based on http://redis.io/commands/set. We also
+    use LUA for speed here in dealing with the nonces. Nonces are usually added by a daemon to the
+    `nonces_key`."""
+
+    #race condition exists where the process takes longer than the deadlock
+    #   timeout. This must NEVER happen.
+
+    def __init__(self, *namespace, session=None, type_in_namespace=False,
+                 timeout_ms=5000): 
+        RedisObj.__init__(self, *namespace, session=session,
+                          type_in_namespace=type_in_namespace)
+        self._timeout = timeout_ms # deadlock timeout
+
+        # This will change with new lua registry.
+        self._lua_acquire = self.session.register_script(self.l_acquire_lock)
+        self._lua_release = self.session.register_script(self.l_release_lock)
+
+    def acquire(self, id_):
+        return  self.lua_acquire(self.gen_key(id_), self._timeout)
+
+    def release(self, id_, nonce):
+        return self.lua_release(self.gen_key(id_), nonce)
+
+
 
 
 # Start actual models.
@@ -600,7 +554,7 @@ class ModelObject:
     unique = set()
 
     # Used to provide a return from the models.
-    feedback = SafeDict(threading.get_ident)
+    feedback = SafeDict()
 
     def __init__(self, *namespace, session=None):
         assert session is not None
@@ -640,7 +594,6 @@ class SubModelObject(ModelObject):
 class Record(ModelObject):
     """
     """
-
     @staticmethod
     def _ingress(obj):
         """Ingress from client."""
@@ -655,7 +608,9 @@ class Record(ModelObject):
 
     def _retrieve(self, location_id):
         record = self.models['record']
-        obj = self._egress(record.get(location_id))
+        key, val = record.get(location_id)
+        log.debug("Record._retrieve: key: %s, val: %s" % (key, val))
+        obj = self._egress(val)
 
         # check child records.
         for child_key in self.children_keys:
@@ -667,6 +622,7 @@ class Record(ModelObject):
     retrieve = _retrieve
 
     def _update(self, **obj):
+        print("Record._update: obj: %s" % obj)
         active_model = self.models['active']
         every_model = self.models['all']
         record_model = self.models['record']
@@ -676,12 +632,12 @@ class Record(ModelObject):
         obj_items = set(obj.items())
         obj_keys = set(obj.keys())
 
-        all_ = every_model.all()
+        _, all_ = every_model.all()
 
         # Check unique "constraint".
         for id_ in all_ - {obj['_id']}: # All but this object.
-            kv_uniques = zip(self.unique, record_model.get(id_, *self.unique))
-
+            _, val = record_model.get(id_, *self.unique)
+            kv_uniques = zip(self.unique, val)
             for key, val in set(kv_uniques) & obj_items:
                 raise UniqueFailed("Unique constraint failed on id: %s  {%s: %s}" % (id_, key, val))
 
@@ -692,8 +648,8 @@ class Record(ModelObject):
         for child_key in obj_keys & self.children_keys:
             sub = self.children[child_key]
             val = obj[child_key]
-            if val: # I hate this here.
-                sub.update(obj['_id'], *obj[child_key])
+            # if val is not None: # I hate this here. HAH!
+            sub.update(obj['_id'], *obj[child_key])
             del obj[child_key]
 
         # Do record updates
@@ -715,12 +671,14 @@ class Record(ModelObject):
         logging.debug('Model all! obj: %s' % obj)
         record = self.models['record']
 
-        if obj.get('active') is True:
+        if obj.get('active_only') is True:
             active = self.models['active']
-            return [self.retrieve(id_) for id_ in active.all()]
+            _, vals = active.all()
+            return [self.retrieve(id_) for id_ in vals]
         else:
             every = self.models['all']
-            return [self.retrieve(id_) for id_ in every.all()]
+            _, vals = every.all()
+            return [self.retrieve(id_) for id_ in vals]
 
     def create(self, **obj):
         obj['_id'] = uuid.uuid4()
@@ -734,21 +692,3 @@ class Record(ModelObject):
         self.update(**obj)
 
 
-class Nonces(List):
-    """
-    """
-    def __init__(self, *namespace, session=None, type_in_namespace=False):
-        List.__init__(self, *namespace, session=session,
-                      type_in_namespace=type_in_namespace)
-
-    def gen(self, n):
-        for _ in range(n):
-            self._rpush(thredis.util.nonce())
-
-    def count(self):
-        key, val = self._count()
-        return val
-
-    def get(self):
-        key, val = self._blpop()
-        return val
