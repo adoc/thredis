@@ -1,6 +1,4 @@
-"""Just some simple threaded redis pool classes. Also some useful
-primitive data models.
-
+"""Thread safe redis extensions.
 """
 # Creted: 2014/03/19
 # Version: 0.3
@@ -11,6 +9,8 @@ primitive data models.
 import logging
 log = logging.getLogger(__name__)
 
+import os
+import sys
 import re
 import functools
 import inspect
@@ -22,11 +22,15 @@ import uuid
 import urllib.parse
 import redis
 import json as _json
-
-from safedict import SafeDict
+import thredis.util
 
 
 __all__ = ('RedisPool', 'ThreadLocalRedisPool', 'UnifiedSession', 'LuaRegistry')
+
+
+__thredis = sys.modules[__name__]
+_thredis_path = os.path.dirname(__thredis.__file__)
+_lua_path = os.path.join(_thredis_path, 'lua')
 
 
 class RedisPool:
@@ -90,7 +94,7 @@ class ThreadLocalRedisPool(RedisPool):
     be shared to multiple threads.
 
     """
-    __registry = SafeDict()
+    __registry = thredis.util.safedict()
 
     @property
     def client(self):
@@ -130,81 +134,6 @@ class ThreadLocalRedisPool(RedisPool):
             del self.__registry['client']
 
     remove = remove_client
-
-
-
-
-class LuaRegistry:
-    """
-    """
-    func_prefix = "_f_"
-
-    # Regex pattern for '$function func_name'
-    func_dec_pattern = re.compile(r"^\$function (\w+)$", re.MULTILINE)
-
-    def __init__(self, session=None):
-        if session is None:
-            raise ValueError("`session` is required for LuaRegistry.")
-        self.session = session
-        self.__raw_source = {}
-
-    def register_function(self, name, lua):
-        """Register a script with Redis.
-
-        Callable within a Redis script
-        """
-        self.__raw_source[self.func_prefix+name] = lua
-
-    def _curse_deps(self, name, pattern):
-        # findall function declaration pattern matches in source dep
-        source = self.__raw_source[name]
-        for func_name in self.func_dec_pattern.findall(source):
-            func_name = func_name.strip()
-            yield func_name or tuple(self._curse_deps(func_name, pattern))
-
-    def _gather_deps(self):
-        keys = self.__raw_source.keys()
-        for dep in keys:
-            yield dep, tuple(self._curse_deps(dep, self.func_dec_pattern))
-    
-    def _render_order(self, done=None):
-        done = done or []
-        if len(done) is len(self.__raw_source):
-            raise StopIteration()
-
-        def notdone(deps):
-            for dep in deps:
-                if not dep in done:
-                    yield dep
-
-        def itera():
-            for k, v in self._gather_deps():
-                if not k in done:
-                    val = tuple(notdone(v))
-                    yield k, val
-
-        def comp(a,b):
-            return len(a[1]) - len(b[1])
-
-        for key, deps in sorted(itera(), key=functools.cmp_to_key(comp)):
-            if len(deps) > 0:
-                log.warn("Script '%s' has unresolveable dependencies %s." % (key, deps))
-            yield key
-            done.append(key)
-            break
-            
-        yield from tuple(self._render_order(done=done))
-
-    def render(self, name):
-        pass
-
-    def render_all(self):
-        order = self._render_order()
-
-        for name in order:
-            self.render(name)
-
-
 
 
 class UnifiedSession(ThreadLocalRedisPool):
@@ -330,3 +259,109 @@ class UnifiedSession(ThreadLocalRedisPool):
         finally:
             self.trigger_exec_event()
             self.remove_pipeline()
+
+
+class LuaRegistry:
+    """
+    """
+    func_prefix = "_f_"
+
+    # Regex pattern for '$function func_name'
+    func_dec_pattern = re.compile(r"^\$function (\w+)$", re.MULTILINE)
+    # vars_dec_pattern = re.compile(r"^\$vars (\w+)$", re.MULTILINE)
+
+    def __init__(self, session=None):
+        if session is None:
+            raise ValueError("`session` is required for LuaRegistry.")
+        self.session = session
+        self.__raw_source = {}
+
+    def register_function(self, name, lua):
+        """Register a script with Redis.
+
+        Callable within a Redis script
+        """
+        self.__raw_source[self.func_prefix+name] = lua
+
+    def _curse_deps(self, name, pattern):
+        # Recurse through dependencies and compile a chain.
+        # findall function declaration pattern matches in source dep
+        source = self.__raw_source[name]
+        for func_name in pattern.findall(source):
+            func_name = func_name.strip()
+            yield func_name or tuple(self._curse_deps(func_name, pattern))
+
+    def _gather_deps(self):
+        # Gather dependencies.
+        keys = self.__raw_source.keys()
+        for dep in keys:
+            yield dep, tuple(self._curse_deps(dep, self.func_dec_pattern))
+    
+    def _render_order(self, done=None):
+        """
+        """
+        done = done or []
+
+        if len(done) is len(self.__raw_source):
+            raise StopIteration()
+
+        def notdone(deps):
+            """
+            """
+            # I dont know....
+            for dep in deps:
+                if not dep in done:
+                    yield dep
+
+        def itera():
+            """Iterate dependecy gather only yielding dependencies not already
+            handled.
+            """
+            for k, v in self._gather_deps():
+                if not k in done:
+                    val = tuple(notdone(v))
+                    yield k, val
+
+        def comp(a, b):
+            """Compare the number of dependencies.
+            """
+            return len(a[1]) - len(b[1])
+
+        for key, deps in sorted(itera(), key=functools.cmp_to_key(comp)):
+            if len(deps) > 0:
+                log.warn("Script '%s' has unresolveable dependencies %s." %
+                        (key, deps))
+            yield key
+            done.append(key)
+            break
+            
+        yield from tuple(self._render_order(done=done))
+
+    def discover_lua(self, path=_lua_path):
+        """
+        """
+        def namespaces():
+            #
+            for root, _, files in os.walk(os.path.expanduser(path)):
+                for name in files:
+                    if name.endswith('.lua'):
+                        rel = os.path.relpath(root, path)
+                        prep = rel.strip('.').split('/')
+                        yield '.'.join(prep+[name[:-4],]).lstrip('.'), os.path.join(root, name)
+
+        def get_source(namespaces):
+            #
+            for ns, filepath in namespaces:
+                yield ns, open(filepath, 'r').read()
+
+        for name, source in get_source(namespaces()):
+            self.register_function(name, source)
+
+    def render(self, name):
+        print("Rendering %s" % name)
+
+    def render_all(self):
+        order = self._render_order()
+
+        for name in order:
+            self.render(name)

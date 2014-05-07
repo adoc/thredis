@@ -210,3 +210,15 @@ class ModelLoopThread(threading.Thread):
                     self.model.session.execute()
             else:
                 print("skip")
+
+
+def timedec(func):
+    """Decorator to time a function and print out the results."""
+    def innerfunc(*args, **kwa):
+        t0=time.time()
+        try:
+            return func(*args,  **kwa)
+        finally:
+            name = func.__name__
+            print("func `%s` timing: %s" % (name, time.time()-t0))
+    return innerfunc
