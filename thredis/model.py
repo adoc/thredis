@@ -82,17 +82,18 @@ class Record(ModelObject):
         return obj
 
     def _retrieve(self, location_id):
-        record = self.models['record']
-        key, val = record.get(location_id)
-        log.debug("Record._retrieve: key: %s, val: %s" % (key, val))
-        obj = self._egress(val)
+        if location_id:
+            record = self.models['record']
+            key, val = record.get(location_id)
+            log.debug("Record._retrieve: key: %s, val: %s" % (key, val))
+            obj = self._egress(val)
 
-        # check child records.
-        for child_key in self.children_keys:
-            sub = self.children[child_key]
-            obj[child_key] = sub.retrieve(obj['_id'])
+            # check child records.
+            for child_key in self.children_keys:
+                sub = self.children[child_key]
+                obj[child_key] = sub.retrieve(obj['_id'])
 
-        return obj
+            return obj
 
     retrieve = _retrieve
 
